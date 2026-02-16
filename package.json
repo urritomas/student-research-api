@@ -4,7 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f api",
+    "docker:build": "docker-compose build"
   },
   "repository": {
     "type": "git",
@@ -14,18 +19,22 @@
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "packageManager": "pnpm@9.15.4",
   "bugs": {
     "url": "https://github.com/urritomas/student-research-api/issues"
   },
   "homepage": "https://github.com/urritomas/student-research-api#readme",
   "dependencies": {
-    "express": "^5.2.1"
+    "@react-oauth/google": "^0.12.2",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "mysql2": "^3.11.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"
-  },
-  "scripts": {
-    "start": "node src/server.js",
-    "dev": "nodemon src/server.js"
   }
 }

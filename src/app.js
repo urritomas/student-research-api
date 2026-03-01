@@ -6,6 +6,7 @@ const usersRouter = require('./modules/users/users.routes');
 const userRouter = require('./modules/user/user.routes');
 const authRouter = require('./modules/auth/auth.routes');
 const uploadRouter = require('./modules/upload/upload.routes');
+const projectsRouter = require('./modules/projects/projects.routes');
 const app = express();
 
 app.use(helmet());
@@ -26,6 +27,7 @@ app.use('/api/auth', authRouter);
 app.use('/api/user', userRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/upload', uploadRouter);
+app.use('/api/projects', projectsRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);

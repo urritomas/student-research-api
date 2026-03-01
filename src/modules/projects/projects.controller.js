@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const projectsService = require('./projects.service');
+const { getRoleByUserId } = require('../users/users.service');
 
 async function create(req, res) {
   try {
@@ -113,10 +114,130 @@ async function getFiles(req, res) {
   }
 }
 
+async function join(req, res) {
+  try {
+    const { projectCode } = req.body;
+    if (!projectCode || typeof projectCode !== 'string' || !projectCode.trim()) {
+      return res.status(400).json({ error: 'Project code is required' });
+    }
+
+    const project = await projectsService.getProjectByCode(projectCode.trim());
+    if (!project) {
+      return res.status(404).json({ error: 'No project found with that code' });
+    }
+
+    const alreadyMember = await projectsService.isProjectMember(project.id, req.user.id);
+    if (alreadyMember) {
+      return res.status(409).json({ error: 'You are already a member of this project' });
+    }
+
+    const userRole = await getRoleByUserId(req.user.id);
+    const memberRole = userRole === 'adviser' ? 'adviser' : 'member';
+
+    await projectsService.joinProject(project.id, req.user.id, memberRole);
+
+    return res.status(200).json({
+      success: true,
+      message: `Successfully joined "${project.title}"`,
+      project: { id: project.id, title: project.title },
+    });
+  } catch (err) {
+    console.error('projects.controller – join error:', err);
+    return res.status(500).json({ error: 'Failed to join project' });
+  }
+}
+
+async function invite(req, res) {
+  try {
+    const { userId, role } = req.body;
+    const projectId = req.params.id;
+
+    if (!userId || typeof userId !== 'string') {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+
+    const validRoles = ['member', 'adviser'];
+    const memberRole = validRoles.includes(role) ? role : 'member';
+
+    const project = await projectsService.getProjectById(projectId);
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const alreadyMember = await projectsService.isProjectMember(projectId, userId);
+    if (alreadyMember) {
+      return res.status(409).json({ error: 'User is already a member or has a pending invitation' });
+    }
+
+    await projectsService.inviteToProject(projectId, userId, memberRole);
+
+    return res.status(201).json({ success: true, message: 'Invitation sent' });
+  } catch (err) {
+    console.error('projects.controller – invite error:', err);
+    return res.status(500).json({ error: 'Failed to send invitation' });
+  }
+}
+
+async function getMyInvitations(req, res) {
+  try {
+    const invitations = await projectsService.getPendingInvitationsForUser(req.user.id);
+    return res.json(invitations);
+  } catch (err) {
+    console.error('projects.controller – getMyInvitations error:', err);
+    return res.status(500).json({ error: 'Failed to fetch invitations' });
+  }
+}
+
+async function respondInvitation(req, res) {
+  try {
+    const { accept } = req.body;
+    const invitationId = req.params.invitationId;
+
+    if (typeof accept !== 'boolean') {
+      return res.status(400).json({ error: 'accept must be a boolean' });
+    }
+
+    const invitation = await projectsService.getInvitationById(invitationId);
+    if (!invitation) {
+      return res.status(404).json({ error: 'Invitation not found' });
+    }
+
+    if (invitation.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'You can only respond to your own invitations' });
+    }
+
+    if (invitation.status !== 'pending') {
+      return res.status(400).json({ error: 'Invitation has already been responded to' });
+    }
+
+    await projectsService.respondToInvitation(invitationId, accept);
+
+    return res.json({ success: true, status: accept ? 'accepted' : 'declined' });
+  } catch (err) {
+    console.error('projects.controller – respondInvitation error:', err);
+    return res.status(500).json({ error: 'Failed to respond to invitation' });
+  }
+}
+
+async function getInvitations(req, res) {
+  try {
+    const invitations = await projectsService.getProjectInvitations(req.params.id);
+    return res.json(invitations);
+  } catch (err) {
+    console.error('projects.controller – getInvitations error:', err);
+    return res.status(500).json({ error: 'Failed to fetch invitations' });
+  }
+}
+
 module.exports = {
   create,
   list,
   getOne,
   getMembers,
   getFiles,
+  join,
+  invite,
+  getMyInvitations,
+  respondInvitation,
+  getInvitations,
 };

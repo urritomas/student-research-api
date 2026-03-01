@@ -3,6 +3,7 @@ const {
   getProfileByUserId,
   getRoleByUserId,
   profileExists,
+  searchUsersByEmail,
   updateMyProfile,
 } = require('./users.service');
 
@@ -58,6 +59,23 @@ async function getMyRole(req, res) {
   return res.json({ role });
 }
 
+async function searchUsers(req, res) {
+  const { email, role, limit } = req.query;
+  if (!email || typeof email !== 'string' || email.trim().length < 2) {
+    return res.status(400).json({ error: 'email query must be at least 2 characters' });
+  }
+  const allowedRoles = ['student', 'adviser'];
+  const filteredRole = role && allowedRoles.includes(role) ? role : null;
+  try {
+    const maxResults = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 20);
+    const results = await searchUsersByEmail(email.trim(), filteredRole, maxResults, req.user.id);
+    return res.json(results);
+  } catch (err) {
+    console.error('searchUsers error:', err);
+    return res.status(500).json({ error: 'Failed to search users' });
+  }
+}
+
 module.exports = {
   getMe,
   getMyProfileExists,
@@ -65,4 +83,5 @@ module.exports = {
   getUserById,
   patchMe,
   postCompleteProfile,
+  searchUsers,
 };

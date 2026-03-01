@@ -7,6 +7,7 @@ const {
   getUserById,
   patchMe,
   postCompleteProfile,
+  searchUsers,
 } = require('./users.controller');
 
 const router = express.Router();
@@ -19,6 +20,7 @@ function asyncHandler(fn) {
 
 router.use(requireAuth);
 
+router.get('/search', asyncHandler(searchUsers));
 router.get('/me', asyncHandler(getMe));
 router.get('/me/exists', asyncHandler(getMyProfileExists));
 router.get('/me/role', asyncHandler(getMyRole));

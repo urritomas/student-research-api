@@ -188,10 +188,52 @@ async function getRoleByUserId(userId) {
   return rows[0]?.role || null;
 }
 
+// [LIMIT ${safeLimit}](http://_vscodecontentref_/7)
+async function searchUsersByEmail(email, role, limit = 10, excludeUserId = null) {
+  const pattern = `%${email}%`;
+  const safeLimit = Math.min(Math.max(Math.floor(Number(limit)) || 10, 1), 20);
+  let query = `
+    SELECT
+      u.id,
+      u.email,
+      u.full_name,
+      u.avatar_url,
+      ur.role
+    FROM users u
+    INNER JOIN user_roles ur
+      ON ur.user_id = u.id
+      AND ur.id = (
+        SELECT ur2.id
+        FROM user_roles ur2
+        WHERE ur2.user_id = u.id
+        ORDER BY ur2.created_at DESC
+        LIMIT 1
+      )
+    WHERE (u.email LIKE ? OR u.full_name LIKE ?)
+  `;
+  const params = [pattern, pattern];
+
+  if (role) {
+    query += ' AND ur.role = ?';
+    params.push(role);
+  }
+
+  if (excludeUserId) {
+    query += ' AND u.id != ?';
+    params.push(excludeUserId);
+  }
+
+  query += ` ORDER BY u.full_name ASC LIMIT ${safeLimit}`;
+
+  const { rows } = await db.query(query, params);
+  return rows;
+}
+
 module.exports = {
   completeProfile,
   getProfileByUserId,
   getRoleByUserId,
   profileExists,
+  searchUsersByEmail,
   updateMyProfile,
 };

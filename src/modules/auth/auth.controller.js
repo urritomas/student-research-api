@@ -29,12 +29,56 @@ async function register(req, res) {
     return res.status(409).json({ error: result.error });
   }
 
+  if (result.pending) {
+    return res.status(201).json({
+      pending: true,
+      message: result.message,
+    });
+  }
+
   res.cookie('session_token', result.token, getCookieOptions());
   return res.status(201).json({
     user: result.user,
     token: result.token,
     message: 'Registration successful',
   });
+}
+
+async function verifyEmail(req, res) {
+  const { token } = req.body;
+
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ error: 'Verification token is required' });
+  }
+
+  const result = await authService.verifyEmailToken(token);
+
+  if (result.error) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  res.cookie('session_token', result.token, getCookieOptions());
+  return res.json({
+    user: result.user,
+    token: result.token,
+    message: result.alreadyVerified ? 'Email already verified.' : 'Email verified successfully.',
+  });
+}
+
+async function resendVerification(req, res) {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+
+  const result = await authService.resendVerification(email);
+
+  if (result.error) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  return res.json({ message: result.message });
 }
 
 async function login(req, res) {
@@ -163,6 +207,8 @@ module.exports = {
   login,
   getMe,
   logout,
+  verifyEmail,
+  resendVerification,
   oAuthRedirect,
   googleCallback,
 };

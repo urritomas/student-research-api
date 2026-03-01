@@ -141,11 +141,51 @@ async function joinProject(projectId, userId, memberRole) {
 }
 
 async function inviteToProject(projectId, userId, role) {
-  await db.query(
-    `INSERT INTO project_members (project_id, user_id, role, status)
-     VALUES (?, ?, ?, 'pending')`,
-    [projectId, userId, role]
-  );
+  const conn = await db.pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    await conn.execute(
+      `INSERT INTO project_members (project_id, user_id, role, status)
+       VALUES (?, ?, ?, 'pending')`,
+      [projectId, userId, role]
+    );
+
+    const [projectRows] = await conn.execute(
+      `SELECT p.title, u.full_name AS invited_by_name
+       FROM projects p
+       JOIN users u ON u.id = p.created_by
+       WHERE p.id = ?
+       LIMIT 1`,
+      [projectId]
+    );
+
+    if (!projectRows.length) {
+      throw new Error('Project not found while creating invitation notification');
+    }
+
+    const project = projectRows[0];
+    await conn.execute(
+      `INSERT INTO notifications (user_id, type, title, message, metadata)
+       VALUES (?, 'invitation', ?, ?, ?)`,
+      [
+        userId,
+        'Project invitation',
+        `You were invited by ${project.invited_by_name || 'a user'} to join "${project.title}" as ${role}.`,
+        JSON.stringify({
+          projectId,
+          role,
+        }),
+      ]
+    );
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }
 
 async function getPendingInvitationsForUser(userId) {

@@ -30,6 +30,7 @@
 
 ## Running the app
 - `npm run dev`
+- `docker-compose up --build`
 
 Production / simple run
 

@@ -9,19 +9,30 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD,
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 0,
 });
 
-// Test connection
-pool.getConnection()
-  .then(connection => {
-    console.log('Database connected successfully');
-    connection.release();
-  })
-  .catch(err => {
-    console.error('Database connection failed:', err);
-    process.exit(-1);
-  });
+async function testConnectionWithRetry(retries = 10, delayMs = 3000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const connection = await pool.getConnection();
+      console.log('Database connected successfully');
+      connection.release();
+      return;
+    } catch (err) {
+      console.error(`Database connection attempt ${attempt}/${retries} failed:`, err.message);
+      if (attempt === retries) {
+        console.error('Could not connect to database after all retries — server will continue but DB queries will fail');
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+testConnectionWithRetry();
 
 module.exports = {
   query: async (text, params) => {

@@ -32,6 +32,7 @@ async function getProfileByUserId(userId) {
       u.full_name,
       u.avatar_url,
       u.status,
+      u.status_text,
       ur.role
     FROM users u
     LEFT JOIN user_roles ur
@@ -56,9 +57,18 @@ async function profileExists(userId) {
   return rows.length > 0;
 }
 
+function normalizeStatusText(value) {
+  if (value === null || value === '') return null;
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length > 255) return undefined;
+  return trimmed || null;
+}
+
 async function updateMyProfile(userId, payload) {
   const fullName = payload.full_name !== undefined ? normalizeDisplayName(payload.full_name) : undefined;
   const avatarUrl = payload.avatar_url !== undefined ? normalizeAvatarUrl(payload.avatar_url) : undefined;
+  const statusText = payload.status_text !== undefined ? normalizeStatusText(payload.status_text) : undefined;
 
   if (payload.full_name !== undefined && !fullName) {
     return { error: 'full_name must be between 2 and 80 characters' };
@@ -66,6 +76,10 @@ async function updateMyProfile(userId, payload) {
 
   if (payload.avatar_url !== undefined && payload.avatar_url !== null && !avatarUrl) {
     return { error: 'avatar_url must be a valid non-empty string or null' };
+  }
+
+  if (payload.status_text !== undefined && statusText === undefined) {
+    return { error: 'status_text must be a string of 255 characters or fewer' };
   }
 
   const updates = [];
@@ -79,6 +93,11 @@ async function updateMyProfile(userId, payload) {
   if (payload.avatar_url !== undefined) {
     updates.push('avatar_url = ?');
     params.push(avatarUrl);
+  }
+
+  if (payload.status_text !== undefined) {
+    updates.push('status_text = ?');
+    params.push(statusText);
   }
 
   if (updates.length === 0) {

@@ -31,7 +31,7 @@ function extractUserFromToken(token) {
     const decoded = jwt.verify(token, jwtSecret);
     const userId = decoded.sub || decoded.userId || decoded.id;
     if (typeof userId === 'string' && userId.length > 0) {
-      return { id: userId };
+      return { id: userId, email: decoded.email || null };
     }
   }
 

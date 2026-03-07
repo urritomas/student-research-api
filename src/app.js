@@ -8,6 +8,7 @@ const authRouter = require('./modules/auth/auth.routes');
 const uploadRouter = require('./modules/upload/upload.routes');
 const projectsRouter = require('./modules/projects/projects.routes');
 const notificationsRouter = require('./modules/notifications/notifications.routes');
+const paperVersionsRouter = require('./modules/paper_versions/paper_versions.routes');
 const app = express();
 
 app.use(helmet());
@@ -30,6 +31,7 @@ app.use('/api/users', usersRouter);
 app.use('/api/upload', uploadRouter);
 app.use('/api/projects', projectsRouter);
 app.use('/api/notifications', notificationsRouter);
+app.use('/api/projects/:id/paper-versions', paperVersionsRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);

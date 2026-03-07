@@ -169,7 +169,7 @@ async function invite(req, res) {
       return res.status(409).json({ error: 'User is already a member or has a pending invitation' });
     }
 
-    await projectsService.inviteToProject(projectId, userId, memberRole);
+    await projectsService.inviteToProject(projectId, userId, memberRole, req.user.id);
 
     return res.status(201).json({ success: true, message: 'Invitation sent' });
   } catch (err) {
@@ -210,7 +210,7 @@ async function respondInvitation(req, res) {
       return res.status(400).json({ error: 'Invitation has already been responded to' });
     }
 
-    await projectsService.respondToInvitation(invitationId, accept);
+    await projectsService.respondToInvitation(invitationId, accept, req.user.id);
 
     return res.json({ success: true, status: accept ? 'accepted' : 'declined' });
   } catch (err) {
@@ -229,6 +229,45 @@ async function getInvitations(req, res) {
   }
 }
 
+async function scheduleDefense(req, res) {
+  try {
+    const projectId = req.params.id;
+    const { defenseType, scheduledAt, location } = req.body || {};
+
+    const validDefenseTypes = ['proposal', 'midterm', 'final'];
+    if (!validDefenseTypes.includes(defenseType)) {
+      return res.status(400).json({ error: 'defenseType must be one of: proposal, midterm, final' });
+    }
+
+    const parsedDate = new Date(scheduledAt);
+    if (!scheduledAt || Number.isNaN(parsedDate.getTime())) {
+      return res.status(400).json({ error: 'scheduledAt must be a valid datetime value' });
+    }
+
+    const project = await projectsService.getProjectById(projectId);
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const defense = await projectsService.createDefenseSchedule({
+      projectId,
+      defenseType,
+      scheduledAt: parsedDate,
+      location: location || null,
+      createdBy: req.user.id,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Defense schedule created',
+      defense,
+    });
+  } catch (err) {
+    console.error('projects.controller – scheduleDefense error:', err);
+    return res.status(500).json({ error: 'Failed to create defense schedule' });
+  }
+}
+
 module.exports = {
   create,
   list,
@@ -240,4 +279,5 @@ module.exports = {
   getMyInvitations,
   respondInvitation,
   getInvitations,
+  scheduleDefense,
 };

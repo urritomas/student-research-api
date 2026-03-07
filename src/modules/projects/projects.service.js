@@ -1,4 +1,5 @@
 const db = require('../../../config/db');
+const notificationsService = require('../notifications/notifications.service');
 
 async function createProject({ title, abstract, keywords, researchType, program, course, section, documentReference, createdBy }) {
   const conn = await db.pool.getConnection();
@@ -140,7 +141,7 @@ async function joinProject(projectId, userId, memberRole) {
   );
 }
 
-async function inviteToProject(projectId, userId, role) {
+async function inviteToProject(projectId, userId, role, invitedByUserId) {
   const conn = await db.pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -152,12 +153,16 @@ async function inviteToProject(projectId, userId, role) {
     );
 
     const [projectRows] = await conn.execute(
-      `SELECT p.title, u.full_name AS invited_by_name
+      `SELECT p.title,
+              p.created_by,
+              creator.full_name AS created_by_name,
+              inviter.full_name AS invited_by_name
        FROM projects p
-       JOIN users u ON u.id = p.created_by
+       JOIN users creator ON creator.id = p.created_by
+       LEFT JOIN users inviter ON inviter.id = ?
        WHERE p.id = ?
        LIMIT 1`,
-      [projectId]
+      [invitedByUserId, projectId]
     );
 
     if (!projectRows.length) {
@@ -165,19 +170,20 @@ async function inviteToProject(projectId, userId, role) {
     }
 
     const project = projectRows[0];
-    await conn.execute(
-      `INSERT INTO notifications (user_id, type, title, message, metadata)
-       VALUES (?, 'invitation', ?, ?, ?)`,
-      [
-        userId,
-        'Project invitation',
-        `You were invited by ${project.invited_by_name || 'a user'} to join "${project.title}" as ${role}.`,
-        JSON.stringify({
-          projectId,
-          role,
-        }),
-      ]
-    );
+    const inviterName = project.invited_by_name || project.created_by_name || 'a user';
+
+    await notificationsService.createNotification({
+      userId,
+      type: 'invitation',
+      title: 'Project invitation',
+      message: `You were invited by ${inviterName} to join "${project.title}" as ${role}.`,
+      metadata: {
+        projectId,
+        role,
+        invitedByUserId: invitedByUserId || project.created_by,
+      },
+      conn,
+    });
 
     await conn.commit();
   } catch (err) {
@@ -211,12 +217,153 @@ async function getInvitationById(invitationId) {
   return rows[0] || null;
 }
 
-async function respondToInvitation(invitationId, accept) {
+async function respondToInvitation(invitationId, accept, respondedByUserId) {
   const status = accept ? 'accepted' : 'declined';
-  await db.query(
-    'UPDATE project_members SET status = ?, responded_at = NOW() WHERE id = ?',
-    [status, invitationId]
+
+  const conn = await db.pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [invitationRows] = await conn.execute(
+      `SELECT pm.id,
+              pm.project_id,
+              pm.user_id,
+              pm.role,
+              pm.status,
+              p.title AS project_title,
+              p.created_by,
+              responder.full_name AS responder_name
+       FROM project_members pm
+       JOIN projects p ON p.id = pm.project_id
+       LEFT JOIN users responder ON responder.id = ?
+       WHERE pm.id = ?
+       LIMIT 1`,
+      [respondedByUserId, invitationId]
+    );
+
+    if (!invitationRows.length) {
+      throw new Error('Invitation not found while responding');
+    }
+
+    const invitation = invitationRows[0];
+
+    await conn.execute(
+      'UPDATE project_members SET status = ?, responded_at = NOW() WHERE id = ?',
+      [status, invitationId]
+    );
+
+    if (invitation.created_by && invitation.created_by !== respondedByUserId) {
+      const responderName = invitation.responder_name || 'A user';
+      await notificationsService.createNotification({
+        userId: invitation.created_by,
+        type: 'invitation',
+        title: 'Invitation response',
+        message: `${responderName} ${accept ? 'accepted' : 'declined'} your invitation to join "${invitation.project_title}" as ${invitation.role}.`,
+        metadata: {
+          projectId: invitation.project_id,
+          invitationId,
+          invitedUserId: invitation.user_id,
+          role: invitation.role,
+          status,
+        },
+        conn,
+      });
+    }
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+async function notifyProjectMembersDefenseScheduled({
+  projectId,
+  defenseType,
+  scheduledAt,
+  location,
+  triggeredByUserId,
+  conn = null,
+}) {
+  const queryRunner = conn || db;
+  const { rows } = await queryRunner.query(
+    `SELECT pm.user_id, p.title
+     FROM project_members pm
+     JOIN projects p ON p.id = pm.project_id
+     WHERE pm.project_id = ? AND pm.status = 'accepted'`,
+    [projectId]
   );
+
+  const recipients = rows
+    .map((row) => row.user_id)
+    .filter((userId) => userId && userId !== triggeredByUserId);
+
+  if (!recipients.length) {
+    return;
+  }
+
+  const projectTitle = rows[0]?.title || 'your project';
+  const formattedType = defenseType || 'Defense';
+  const scheduledLabel = scheduledAt
+    ? new Date(scheduledAt).toLocaleString('en-US', { hour12: true })
+    : 'TBA';
+
+  await Promise.all(
+    recipients.map((userId) => notificationsService.createNotification({
+      userId,
+      type: 'schedule',
+      title: 'Defense schedule updated',
+      message: `${formattedType} for "${projectTitle}" is scheduled on ${scheduledLabel}${location ? ` at ${location}` : ''}.`,
+      metadata: {
+        projectId,
+        defenseType: defenseType || null,
+        scheduledAt: scheduledAt || null,
+        location: location || null,
+      },
+      conn,
+    }))
+  );
+}
+
+async function createDefenseSchedule({ projectId, defenseType, scheduledAt, location, createdBy }) {
+  const conn = await db.pool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    await conn.execute(
+      `INSERT INTO defenses (project_id, defense_type, scheduled_at, location, status, created_by)
+       VALUES (?, ?, ?, ?, 'scheduled', ?)`,
+      [projectId, defenseType, scheduledAt, location || null, createdBy]
+    );
+
+    const [rows] = await conn.execute(
+      `SELECT * FROM defenses
+       WHERE project_id = ? AND defense_type = ? AND scheduled_at = ? AND created_by = ?
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [projectId, defenseType, scheduledAt, createdBy]
+    );
+
+    await notifyProjectMembersDefenseScheduled({
+      projectId,
+      defenseType,
+      scheduledAt,
+      location,
+      triggeredByUserId: createdBy,
+      conn,
+    });
+
+    await conn.commit();
+    return rows[0] || null;
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }
 
 async function getProjectInvitations(projectId) {
@@ -255,6 +402,8 @@ module.exports = {
   getInvitationById,
   respondToInvitation,
   getProjectInvitations,
+  notifyProjectMembersDefenseScheduled,
+  createDefenseSchedule,
   addProjectFile,
   updateProjectDocumentRef,
   getProjectFiles,

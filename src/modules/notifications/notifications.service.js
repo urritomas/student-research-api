@@ -1,10 +1,15 @@
 const db = require('../../../config/db');
 
-async function createNotification({ userId, type, title, message, metadata }) {
-  await db.query(
+const NOTIFICATION_TYPES = new Set(['invitation', 'schedule']);
+
+async function createNotification({ userId, type, title, message, metadata, conn = null }) {
+  const notificationType = NOTIFICATION_TYPES.has(type) ? type : 'invitation';
+  const queryRunner = conn || db;
+
+  await queryRunner.query(
     `INSERT INTO notifications (user_id, type, title, message, metadata)
      VALUES (?, ?, ?, ?, ?)`,
-    [userId, type, title, message, metadata ? JSON.stringify(metadata) : null]
+    [userId, notificationType, title, message, metadata ? JSON.stringify(metadata) : null]
   );
 }
 
@@ -19,13 +24,22 @@ async function getNotificationsForUser(userId, { limit = 50 } = {}) {
     [userId, safeLimit]
   );
 
-  return rows.map((row) => ({
-    ...row,
-    metadata: typeof row.metadata === 'string'
-      ? JSON.parse(row.metadata)
-      : (row.metadata || null),
-    is_read: Boolean(row.is_read),
-  }));
+  return rows.map((row) => {
+    let parsedMetadata = row.metadata || null;
+    if (typeof row.metadata === 'string') {
+      try {
+        parsedMetadata = JSON.parse(row.metadata);
+      } catch {
+        parsedMetadata = null;
+      }
+    }
+
+    return {
+      ...row,
+      metadata: parsedMetadata,
+      is_read: Boolean(row.is_read),
+    };
+  });
 }
 
 async function markNotificationAsRead(notificationId, userId) {

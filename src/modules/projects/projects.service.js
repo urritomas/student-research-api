@@ -51,7 +51,7 @@ async function createProject({ title, abstract, keywords, researchType, program,
 async function getProjectsByUser(userId) {
   const { rows } = await db.query(
     `SELECT p.*,
-            pm_self.role AS member_role
+            ANY_VALUE(pm_self.role) AS member_role
      FROM projects p
      LEFT JOIN project_members pm_self
        ON pm_self.project_id = p.id

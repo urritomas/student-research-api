@@ -76,6 +76,22 @@ async function list(req, res) {
   }
 }
 
+async function listAdvised(req, res) {
+  try {
+    const projects = await projectsService.getAdvisedProjects(req.user.id);
+
+    const mapped = projects.map((p) => ({
+      ...p,
+      keywords: typeof p.keywords === 'string' ? JSON.parse(p.keywords) : (p.keywords || []),
+    }));
+
+    return res.json(mapped);
+  } catch (err) {
+    console.error('projects.controller – listAdvised error:', err);
+    return res.status(500).json({ error: 'Failed to fetch advised projects' });
+  }
+}
+
 async function getOne(req, res) {
   try {
     const project = await projectsService.getProjectById(req.params.id);
@@ -271,6 +287,7 @@ async function scheduleDefense(req, res) {
 module.exports = {
   create,
   list,
+  listAdvised,
   getOne,
   getMembers,
   getFiles,

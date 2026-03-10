@@ -1,6 +1,6 @@
 export type UserRoleEnum = 'student' | 'adviser' | 'panelist' | 'admin';
 
-export interface User {
+export interface UserRoles {
   id: string;
   user_id: string;
   role: UserRoleEnum;
@@ -8,4 +8,4 @@ export interface User {
   created_at?: Date;
 }
 
-export default User;
+export default UserRoles;

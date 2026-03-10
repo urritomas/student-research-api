@@ -1,4 +1,4 @@
-export interface Evaluation {
+export interface Evaluations {
   id: string;
   defense_id: string;
   project_id: string;
@@ -9,4 +9,4 @@ export interface Evaluation {
   created_at?: Date;
 }
 
-export default Evaluation;
+export default Evaluations;

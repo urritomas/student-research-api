@@ -14,11 +14,14 @@ WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
 
 # Install ALL dependencies (including devDependencies for nodemon in dev)
-# Allow installation when lockfile is out-of-date (useful until pnpm-lock.yaml is regenerated)
 RUN pnpm install --no-frozen-lockfile
 
 # Copy application code
 COPY . .
+
+# Fix CRLF line endings on entrypoint script (Windows compatibility)
+RUN sed -i 's/\r//' /app/docker-entrypoint.sh && \
+    chmod +x /app/docker-entrypoint.sh
 
 # Ensure uploads directory exists with correct permissions
 RUN mkdir -p /app/uploads/avatars && chown -R node:node /app/uploads

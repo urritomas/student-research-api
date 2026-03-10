@@ -389,6 +389,21 @@ async function getProjectInvitations(projectId) {
   }));
 }
 
+async function getAdvisedProjects(userId) {
+  const { rows } = await db.query(
+    `SELECT p.*, pm.role AS member_role
+     FROM projects p
+     JOIN project_members pm
+       ON pm.project_id = p.id
+       AND pm.user_id = ?
+       AND pm.status = 'accepted'
+       AND pm.role = 'adviser'
+     ORDER BY p.created_at DESC`,
+    [userId]
+  );
+  return rows;
+}
+
 module.exports = {
   createProject,
   getProjectsByUser,
@@ -407,4 +422,5 @@ module.exports = {
   addProjectFile,
   updateProjectDocumentRef,
   getProjectFiles,
+  getAdvisedProjects,
 };

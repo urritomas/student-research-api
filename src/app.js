@@ -9,12 +9,18 @@ const uploadRouter = require('./modules/upload/upload.routes');
 const projectsRouter = require('./modules/projects/projects.routes');
 const notificationsRouter = require('./modules/notifications/notifications.routes');
 const paperVersionsRouter = require('./modules/paper_versions/paper_versions.routes');
+const defensesRouter = require('./modules/defenses/defenses.routes');
 const app = express();
 
 app.use(helmet());
 app.use(cors({
-  origin: process.env.WEB_ORIGIN || 'http://localhost:3000',
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:3001',
+  ],
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 app.use(express.json({ limit: '10mb' })); // For parsing application/json (allow base64 payloads)
@@ -32,6 +38,7 @@ app.use('/api/upload', uploadRouter);
 app.use('/api/projects', projectsRouter);
 app.use('/api/notifications', notificationsRouter);
 app.use('/api/projects/:id/paper-versions', paperVersionsRouter);
+app.use('/api/defenses', defensesRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);

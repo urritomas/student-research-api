@@ -32,7 +32,11 @@ async function createDefense(userId, payload) {
  
 async function getDefensesByUser(userId) {
   const { rows } = await db.query(
-    'SELECT * FROM defenses WHERE created_by = ? ORDER BY start_time DESC',
+    `SELECT d.*, p.title AS project_title, p.project_code
+     FROM defenses d
+     LEFT JOIN projects p ON d.project_id = p.id
+     WHERE d.created_by = ?
+     ORDER BY d.start_time DESC`,
     [userId]
   );
   return rows;

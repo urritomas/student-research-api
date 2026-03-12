@@ -72,7 +72,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    entrypoint: ["sh", "/app/docker-entrypoint.sh"]
+    entrypoint: ["sh", "-c", "sed -i 's/\\r//' /app/docker-entrypoint.sh && sh /app/docker-entrypoint.sh"]
 
 networks:
   backend:

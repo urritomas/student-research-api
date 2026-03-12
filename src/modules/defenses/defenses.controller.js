@@ -1,4 +1,4 @@
-const { createDefense, getDefensesByUser } = require('./defenses.service');
+const { createDefense, getDefensesByUser, cancelDefense } = require('./defenses.service');
 
 async function postDefense(req, res) {
   const result = await createDefense(req.user.id, req.body || {});
@@ -13,4 +13,16 @@ async function getMyDefenses(req, res) {
   return res.json(defenses);
 }
 
-module.exports = { postDefense, getMyDefenses };
+async function patchCancelDefense(req, res) {
+  const result = await cancelDefense(req.user.id, req.params.id);
+  if (result.error) {
+    return res.status(result.status || 400).json({ error: result.error });
+  }
+  return res.json({
+    success: true,
+    message: 'Meeting cancelled',
+    defense: result.data,
+  });
+}
+
+module.exports = { postDefense, getMyDefenses, patchCancelDefense };

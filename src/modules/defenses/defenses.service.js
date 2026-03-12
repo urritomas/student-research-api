@@ -256,7 +256,12 @@ async function createDefense(userId, payload) {
  
 async function getDefensesByUser(userId) {
   const { rows } = await db.query(
-    `SELECT d.*, p.title AS project_title, p.project_code
+    `SELECT d.*, p.title AS project_title, p.project_code,
+            CASE
+              WHEN d.status = 'cancelled' THEN 'Cancelled'
+              WHEN d.status = 'completed' THEN 'Approved'
+              ELSE 'Pending'
+            END AS status_label
      FROM defenses d
      LEFT JOIN projects p ON d.project_id = p.id
      WHERE d.created_by = ?
@@ -265,5 +270,52 @@ async function getDefensesByUser(userId) {
   );
   return rows;
 }
+
+async function cancelDefense(userId, defenseId) {
+  if (!defenseId) {
+    return { error: 'defenseId is required', status: 400 };
+  }
+
+  const { rows } = await db.query(
+    'SELECT * FROM defenses WHERE id = ? LIMIT 1',
+    [defenseId]
+  );
+
+  if (!rows.length) {
+    return { error: 'Meeting not found', status: 404 };
+  }
+
+  const defense = rows[0];
+  if (defense.created_by !== userId) {
+    return { error: 'You are not allowed to cancel this meeting', status: 403 };
+  }
+
+  if (defense.status === 'cancelled') {
+    return { error: 'Meeting is already cancelled', status: 409 };
+  }
+
+  await db.query(
+    `UPDATE defenses
+     SET status = 'cancelled'
+     WHERE id = ?`,
+    [defenseId]
+  );
+
+  const { rows: updatedRows } = await db.query(
+    `SELECT d.*, p.title AS project_title, p.project_code,
+            CASE
+              WHEN d.status = 'cancelled' THEN 'Cancelled'
+              WHEN d.status = 'completed' THEN 'Approved'
+              ELSE 'Pending'
+            END AS status_label
+     FROM defenses d
+     LEFT JOIN projects p ON d.project_id = p.id
+     WHERE d.id = ?
+     LIMIT 1`,
+    [defenseId]
+  );
+
+  return { data: updatedRows[0] || null };
+}
  
-module.exports = { createDefense, getDefensesByUser };
+module.exports = { createDefense, getDefensesByUser, cancelDefense };

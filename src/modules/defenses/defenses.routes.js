@@ -1,6 +1,6 @@
 const express = require('express');
 const { requireAuth } = require('../../middleware/auth');
-const { postDefense, getMyDefenses, patchCancelDefense } = require('./defenses.controller');
+const { postDefense, getMyDefenses, patchCancelDefense, patchRescheduleDefense } = require('./defenses.controller');
 
 const router = express.Router();
 
@@ -15,5 +15,6 @@ router.use(requireAuth);
 router.post('/', asyncHandler(postDefense));
 router.get('/me', asyncHandler(getMyDefenses));
 router.patch('/:id/cancel', asyncHandler(patchCancelDefense));
+router.patch('/:id/reschedule', asyncHandler(patchRescheduleDefense));
 
 module.exports = router;

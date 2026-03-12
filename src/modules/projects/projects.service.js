@@ -404,6 +404,28 @@ async function getAdvisedProjects(userId) {
   return rows;
 }
 
+const ALLOWED_STATUSES = new Set(['draft', 'active', 'completed', 'archived']);
+
+async function updateProjectStatus(projectId, status, userId) {
+  if (!ALLOWED_STATUSES.has(status)) {
+    return { error: 'Invalid status. Allowed: draft, active, completed, archived' };
+  }
+
+  // Verify user is adviser of this project
+  const isMember = await isProjectMember(projectId, userId);
+  if (!isMember) {
+    return { error: 'You are not a member of this project' };
+  }
+
+  await db.query(
+    'UPDATE projects SET status = ?, updated_at = NOW() WHERE id = ?',
+    [status, projectId]
+  );
+
+  const project = await getProjectById(projectId);
+  return { data: project };
+}
+
 module.exports = {
   createProject,
   getProjectsByUser,
@@ -423,4 +445,5 @@ module.exports = {
   updateProjectDocumentRef,
   getProjectFiles,
   getAdvisedProjects,
+  updateProjectStatus,
 };

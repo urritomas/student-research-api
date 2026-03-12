@@ -13,7 +13,7 @@ function asyncHandler(fn) {
 router.use(requireAuth);
 
 router.get('/', asyncHandler(controller.list));
-router.patch('/:id/read', asyncHandler(controller.markRead));
 router.patch('/read-all', asyncHandler(controller.markAllRead));
+router.patch('/:id/read', asyncHandler(controller.markRead));
 
 module.exports = router;

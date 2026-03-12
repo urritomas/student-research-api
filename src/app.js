@@ -10,6 +10,7 @@ const projectsRouter = require('./modules/projects/projects.routes');
 const notificationsRouter = require('./modules/notifications/notifications.routes');
 const paperVersionsRouter = require('./modules/paper_versions/paper_versions.routes');
 const defensesRouter = require('./modules/defenses/defenses.routes');
+const coordinatorRouter = require('./modules/coordinator/coordinator.routes');
 const app = express();
 
 app.use(helmet());
@@ -39,6 +40,7 @@ app.use('/api/projects', projectsRouter);
 app.use('/api/notifications', notificationsRouter);
 app.use('/api/projects/:id/paper-versions', paperVersionsRouter);
 app.use('/api/defenses', defensesRouter);
+app.use('/api/coordinator', coordinatorRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);

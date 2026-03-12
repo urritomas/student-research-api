@@ -1,6 +1,6 @@
 const express = require('express');
 const { requireAuth } = require('../../middleware/auth');
-const { postDefense, getMyDefenses } = require('./defenses.controller');
+const { postDefense, getMyDefenses, getMyProjectDefenses } = require('./defenses.controller');
 
 const router = express.Router();
 
@@ -14,5 +14,6 @@ router.use(requireAuth);
 
 router.post('/', asyncHandler(postDefense));
 router.get('/me', asyncHandler(getMyDefenses));
+router.get('/my-projects', asyncHandler(getMyProjectDefenses));
 
 module.exports = router;

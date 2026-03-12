@@ -1,6 +1,6 @@
 const db = require('../../../config/db');
 
-const ALLOWED_ROLE_VALUES = new Set(['student', 'teacher', 'adviser']);
+const ALLOWED_ROLE_VALUES = new Set(['student', 'teacher', 'adviser', 'coordinator']);
 
 function normalizeRole(role) {
   if (!role || typeof role !== 'string') return null;
@@ -129,7 +129,7 @@ async function completeProfile(userId, payload) {
   }
 
   if (!role) {
-    return { error: 'role must be one of: student, teacher, adviser' };
+    return { error: 'role must be one of: student, teacher, adviser, coordinator' };
   }
 
   const email = typeof payload.email === 'string' && payload.email.trim() ? payload.email.trim() : null;
@@ -160,22 +160,47 @@ async function completeProfile(userId, payload) {
     [userId],
   );
 
+  let institutionId = null;
+
+  if (role === 'coordinator') {
+    const instName = typeof payload.institutionName === 'string' && payload.institutionName.trim()
+      ? payload.institutionName.trim()
+      : `${displayName}'s Institution`;
+    const instCode = instName.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10) + '-' + Date.now().toString(36).toUpperCase();
+
+    await db.query(
+      `INSERT INTO institutions (id, name, code, created_at, updated_at) VALUES (UUID(), ?, ?, NOW(), NOW())`,
+      [instName, instCode],
+    );
+
+    const { rows: instRows } = await db.query(
+      'SELECT id FROM institutions WHERE code = ? LIMIT 1',
+      [instCode],
+    );
+    institutionId = instRows[0]?.id || null;
+  }
+
   if (!currentRole.rows[0]) {
     await db.query(
-      'INSERT INTO user_roles (id, user_id, role, created_at) VALUES (UUID(), ?, ?, NOW())',
-      [userId, role],
+      'INSERT INTO user_roles (id, user_id, role, institution_id, created_at) VALUES (UUID(), ?, ?, ?, NOW())',
+      [userId, role, institutionId],
     );
   } else if (currentRole.rows[0].role !== role) {
     await db.query(
-      'UPDATE user_roles SET role = ? WHERE id = ?',
-      [role, currentRole.rows[0].id],
+      'UPDATE user_roles SET role = ?, institution_id = ? WHERE id = ?',
+      [role, institutionId, currentRole.rows[0].id],
+    );
+  } else if (role === 'coordinator' && institutionId) {
+    await db.query(
+      'UPDATE user_roles SET institution_id = ? WHERE id = ?',
+      [institutionId, currentRole.rows[0].id],
     );
   }
 
   return {
     data: {
       success: true,
-      redirectPath: role === 'student' ? '/student' : '/adviser',
+      redirectPath: role === 'student' ? '/student' : role === 'coordinator' ? '/coordinator' : '/adviser',
     },
   };
 }
@@ -192,6 +217,9 @@ async function getRoleByUserId(userId) {
 async function searchUsersByEmail(email, role, limit = 10, excludeUserId = null) {
   const pattern = `%${email}%`;
   const safeLimit = Math.min(Math.max(Math.floor(Number(limit)) || 10, 1), 20);
+
+  const isUuid = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(email);
+
   let query = `
     SELECT
       u.id,
@@ -209,9 +237,10 @@ async function searchUsersByEmail(email, role, limit = 10, excludeUserId = null)
         ORDER BY ur2.created_at DESC
         LIMIT 1
       )
-    WHERE (u.email LIKE ? OR u.full_name LIKE ?)
+    WHERE (u.email LIKE ? OR u.full_name LIKE ?${isUuid ? ' OR u.id = ?' : ''})
   `;
   const params = [pattern, pattern];
+  if (isUuid) params.push(email);
 
   if (role) {
     query += ' AND ur.role = ?';

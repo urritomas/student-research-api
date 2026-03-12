@@ -1,4 +1,4 @@
-const { createDefense, getDefensesByUser } = require('./defenses.service');
+const { createDefense, getDefensesByUser, getDefensesForMember } = require('./defenses.service');
 
 async function postDefense(req, res) {
   const result = await createDefense(req.user.id, req.body || {});
@@ -13,4 +13,9 @@ async function getMyDefenses(req, res) {
   return res.json(defenses);
 }
 
-module.exports = { postDefense, getMyDefenses };
+async function getMyProjectDefenses(req, res) {
+  const defenses = await getDefensesForMember(req.user.id);
+  return res.json(defenses);
+}
+
+module.exports = { postDefense, getMyDefenses, getMyProjectDefenses };

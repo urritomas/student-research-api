@@ -1,16 +1,20 @@
 const db = require('../../../config/db');
 
-const NOTIFICATION_TYPES = new Set(['invitation', 'schedule']);
+const NOTIFICATION_TYPES = new Set(['invitation', 'schedule', 'defense_approved', 'defense_rejected', 'defense_moved']);
 
 async function createNotification({ userId, type, title, message, metadata, conn = null }) {
   const notificationType = NOTIFICATION_TYPES.has(type) ? type : 'invitation';
-  const queryRunner = conn || db;
 
-  await queryRunner.query(
-    `INSERT INTO notifications (user_id, type, title, message, metadata)
-     VALUES (?, ?, ?, ?, ?)`,
-    [userId, notificationType, title, message, metadata ? JSON.stringify(metadata) : null]
-  );
+  const sql = `INSERT INTO notifications (user_id, type, title, message, metadata)
+     VALUES (?, ?, ?, ?, ?)`;
+  const params = [userId, notificationType, title, message, metadata ? JSON.stringify(metadata) : null];
+
+  if (conn) {
+    // Use execute (prepared statement) to stay consistent with the caller's transaction
+    await conn.execute(sql, params);
+  } else {
+    await db.query(sql, params);
+  }
 }
 
 async function getNotificationsForUser(userId, { limit = 50 } = {}) {
@@ -20,8 +24,8 @@ async function getNotificationsForUser(userId, { limit = 50 } = {}) {
      FROM notifications
      WHERE user_id = ?
      ORDER BY created_at DESC
-     LIMIT ?`,
-    [userId, safeLimit]
+     LIMIT ${safeLimit}`,
+    [userId]
   );
 
   return rows.map((row) => {

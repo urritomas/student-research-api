@@ -11,7 +11,7 @@ function formatDateToDbUtc(date) {
 }
 
 function normalizeDateTimeInput(value) {
-  // mysql2 returns DATETIME columns as JS Date objects — handle them directly.
+  // mysql2 returns DATETIME columns as JS Date objects, handle them directly.
   if (value instanceof Date && !Number.isNaN(value.getTime())) {
     const pad = (n) => String(n).padStart(2, '0');
     const dbValue = `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}`;
@@ -54,70 +54,11 @@ async function queryRows(queryRunner, sql, params) {
   return result.rows;
 }
 
-// Dynamic Programming Algorithm:
-// Uses a difference array + prefix-sum state transition over discretized time points
-// to compute active occupancy per segment and detect overlap conflicts efficiently.
-function buildOccupancyDp(intervals, candidateStart, candidateEnd) {
-  if (!intervals.length) {
-    return { hasConflict: false, conflictingIntervals: [] };
-  }
-
-  const candidateStartMs = candidateStart.getTime();
-  const candidateEndMs = candidateEnd.getTime();
-
-  const pointsSet = new Set([candidateStartMs, candidateEndMs]);
-  const normalized = intervals
-    .map((interval) => {
-      const start = toDate(interval.start_time);
-      const end = toDate(interval.end_time);
-      if (!start || !end) return null;
-      return {
-        ...interval,
-        startMs: start.getTime(),
-        endMs: end.getTime(),
-      };
-    })
-    .filter((interval) => interval && interval.startMs < interval.endMs);
-
-  for (const interval of normalized) {
-    pointsSet.add(interval.startMs);
-    pointsSet.add(interval.endMs);
-  }
-
-  const points = Array.from(pointsSet).sort((a, b) => a - b);
-  const indexByPoint = new Map(points.map((point, index) => [point, index]));
-  const diff = Array(points.length).fill(0);
-
-  for (const interval of normalized) {
-    const startIndex = indexByPoint.get(interval.startMs);
-    const endIndex = indexByPoint.get(interval.endMs);
-    diff[startIndex] += 1;
-    diff[endIndex] -= 1;
-  }
-
-  // Prefix accumulation over segments gives active meeting count per timeslice.
-  let active = 0;
-  let hasConflict = false;
-  for (let i = 0; i < points.length - 1; i += 1) {
-    active += diff[i];
-    const segmentStart = points[i];
-    const segmentEnd = points[i + 1];
-    const intersectsCandidate = segmentEnd > candidateStartMs && segmentStart < candidateEndMs;
-    if (intersectsCandidate && active > 0) {
-      hasConflict = true;
-      break;
-    }
-  }
-
-  if (!hasConflict) {
-    return { hasConflict: false, conflictingIntervals: [] };
-  }
-
-  const conflictingIntervals = normalized.filter((interval) => (
-    interval.startMs < candidateEndMs && interval.endMs > candidateStartMs
-  ));
-
-  return { hasConflict: true, conflictingIntervals };
+function buildExactTimeConflicts(intervals) {
+  return {
+    hasConflict: intervals.length > 0,
+    conflictingIntervals: intervals,
+  };
 }
 
 async function getProjectMemberGroups(projectId, fallbackUserId, queryRunner = db) {
@@ -154,7 +95,7 @@ function buildInClausePlaceholders(items) {
   return items.map(() => '?').join(', ');
 }
 
-async function getParticipantSchedules(userIds, candidateStart, candidateEnd, queryRunner = db) {
+async function getParticipantSchedules(userIds, scheduledAt, queryRunner = db) {
   if (!userIds.length) {
     return [];
   }
@@ -162,104 +103,80 @@ async function getParticipantSchedules(userIds, candidateStart, candidateEnd, qu
   const placeholders = buildInClausePlaceholders(userIds);
   const rows = await queryRows(
     queryRunner,
-    `SELECT DISTINCT d.id, d.project_id, d.start_time, d.end_time, d.location, pm.user_id AS participant_id
+    `SELECT DISTINCT d.id, d.project_id, d.scheduled_at, d.location, pm.user_id AS participant_id
      FROM defenses d
      JOIN project_members pm
        ON pm.project_id = d.project_id
       AND pm.status = 'accepted'
      WHERE pm.user_id IN (${placeholders})
        AND d.status = 'scheduled'
-       AND d.start_time < ?
-       AND d.end_time > ?`,
-    [...userIds, candidateEnd, candidateStart]
+       AND d.scheduled_at = ?`,
+    [...userIds, scheduledAt]
   );
 
   return rows;
 }
 
-async function getRoomSchedules(location, candidateStart, candidateEnd, queryRunner = db) {
+async function getRoomSchedules(location, scheduledAt, queryRunner = db) {
   if (!location || location.toLowerCase() === 'online') {
     return [];
   }
 
   const rows = await queryRows(
     queryRunner,
-    `SELECT id, project_id, start_time, end_time, location
+    `SELECT id, project_id, scheduled_at, location
      FROM defenses
      WHERE status = 'scheduled'
        AND location = ?
-       AND start_time < ?
-       AND end_time > ?`,
-    [location, candidateEnd, candidateStart]
+       AND scheduled_at = ?`,
+    [location, scheduledAt]
   );
 
   return rows;
 }
 
-async function getProjectSchedules(projectId, candidateStart, candidateEnd, queryRunner = db) {
+async function getProjectSchedules(projectId, scheduledAt, queryRunner = db) {
   const rows = await queryRows(
     queryRunner,
-    `SELECT id, project_id, start_time, end_time, location
+    `SELECT id, project_id, scheduled_at, location
      FROM defenses
      WHERE project_id = ?
        AND status = 'scheduled'
-       AND start_time < ?
-       AND end_time > ?`,
-    [projectId, candidateEnd, candidateStart]
+       AND scheduled_at = ?`,
+    [projectId, scheduledAt]
   );
   return rows;
 }
 
-// Compute how many minutes of the candidate [candidateStart, candidateEnd] are
-// consumed by a single conflicting interval.
-function computeOverlapMinutes(conflictStart, conflictEnd, candidateStartMs, candidateEndMs) {
-  const overlapStart = Math.max(conflictStart, candidateStartMs);
-  const overlapEnd = Math.min(conflictEnd, candidateEndMs);
-  return Math.max(0, Math.round((overlapEnd - overlapStart) / 60000));
-}
-
-// Returns how many minutes remain in the *blocking* meeting at the point the
-// candidate would start (i.e. how long the user would need to wait).
-function computeRemainingMinutes(conflictEndMs, candidateStartMs) {
-  return Math.max(0, Math.round((conflictEndMs - candidateStartMs) / 60000));
-}
-
-async function validateScheduleConstraints({ projectId, startTime, endTime, startDate, endDate, location, fallbackTeacherId, queryRunner = db }) {
+async function validateScheduleConstraints({ projectId, scheduledAt, location, fallbackTeacherId, queryRunner = db }) {
   const [projectSchedules, roomSchedules, memberGroups] = await Promise.all([
-    getProjectSchedules(projectId, startTime, endTime, queryRunner),
-    getRoomSchedules(location, startTime, endTime, queryRunner),
+    getProjectSchedules(projectId, scheduledAt, queryRunner),
+    getRoomSchedules(location, scheduledAt, queryRunner),
     getProjectMemberGroups(projectId, fallbackTeacherId, queryRunner),
   ]);
 
   const [teacherSchedules, studentSchedules] = await Promise.all([
-    getParticipantSchedules(memberGroups.teacherIds, startTime, endTime, queryRunner),
-    getParticipantSchedules(memberGroups.studentIds, startTime, endTime, queryRunner),
+    getParticipantSchedules(memberGroups.teacherIds, scheduledAt, queryRunner),
+    getParticipantSchedules(memberGroups.studentIds, scheduledAt, queryRunner),
   ]);
 
-  const candidateStartMs = startDate.getTime();
-  const candidateEndMs = endDate.getTime();
-
-  // Collect all conflict details across every domain.
   const allConflicts = [];
 
   const checks = [
-    { label: 'project', result: buildOccupancyDp(projectSchedules, startDate, endDate) },
-    { label: 'room', result: buildOccupancyDp(roomSchedules, startDate, endDate) },
-    { label: 'teacher', result: buildOccupancyDp(teacherSchedules, startDate, endDate) },
-    { label: 'student', result: buildOccupancyDp(studentSchedules, startDate, endDate) },
+    { label: 'project', result: buildExactTimeConflicts(projectSchedules) },
+    { label: 'room', result: buildExactTimeConflicts(roomSchedules) },
+    { label: 'teacher', result: buildExactTimeConflicts(teacherSchedules) },
+    { label: 'student', result: buildExactTimeConflicts(studentSchedules) },
   ];
 
   for (const { label, result } of checks) {
     if (result.hasConflict) {
       for (const interval of result.conflictingIntervals) {
-        const remaining = computeRemainingMinutes(interval.endMs, candidateStartMs);
-        const overlap = computeOverlapMinutes(interval.startMs, interval.endMs, candidateStartMs, candidateEndMs);
         allConflicts.push({
           domain: label,
           defense_id: interval.id,
           project_id: interval.project_id,
-          remaining_minutes: remaining,
-          overlap_minutes: overlap,
+          scheduled_at: interval.scheduled_at,
         });
       }
     }
@@ -271,96 +188,92 @@ async function validateScheduleConstraints({ projectId, startTime, endTime, star
 
   return { ok: false, conflicts: allConflicts };
 }
- 
+
 async function createDefense(userId, payload) {
   let conn;
   try {
-    const { project_id, section, defense_type, start_time, end_time, location, partial_time, force_partial, force_pending } = payload;
- 
+    const { project_id, defense_type, scheduled_at, location, modality, force_pending, submit_as_proposal } = payload;
+    const scheduleInput = scheduled_at;
+
     if (!project_id) return { error: 'project_id is required' };
     if (!defense_type || !['proposal', 'midterm', 'final'].includes(defense_type)) {
       return { error: 'defense_type must be one of: proposal, midterm, final' };
     }
-    if (!start_time) return { error: 'start_time is required' };
-    if (!end_time) return { error: 'end_time is required' };
+    if (!scheduleInput) return { error: 'scheduled_at is required' };
     if (!location) return { error: 'location is required' };
 
-    const normalizedStart = normalizeDateTimeInput(start_time);
-    const normalizedEnd = normalizeDateTimeInput(end_time);
-    if (!normalizedStart) return { error: 'start_time must be a valid datetime value' };
-    if (!normalizedEnd) return { error: 'end_time must be a valid datetime value' };
-    if (normalizedStart.dateValue.getTime() >= normalizedEnd.dateValue.getTime()) {
-      return { error: 'end_time must be after start_time' };
-    }
+    const normalizedSchedule = normalizeDateTimeInput(scheduleInput);
+    if (!normalizedSchedule) return { error: 'scheduled_at must be a valid datetime value' };
 
     conn = await db.pool.getConnection();
     await conn.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
     await conn.beginTransaction();
 
+    const [projectRows] = await conn.execute(
+      'SELECT id, institution_id FROM projects WHERE id = ? LIMIT 1',
+      [project_id]
+    );
+
+    const project = projectRows[0];
+    if (!project) {
+      await conn.rollback();
+      return { error: 'Project not found', status: 404 };
+    }
+
+    const [institutionRows] = await conn.execute(
+      `SELECT institution_id
+       FROM user_roles
+       WHERE user_id = ?
+         AND role = 'adviser'
+         AND institution_id IS NOT NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId]
+    );
+
+    const adviserInstitutionId = institutionRows[0]?.institution_id || null;
+    if (!adviserInstitutionId) {
+      await conn.rollback();
+      return {
+        error: 'Adviser must be assigned to an institution before submitting a defense proposal.',
+        status: 400,
+      };
+    }
+
+    if (!project.institution_id) {
+      await conn.execute(
+        'UPDATE projects SET institution_id = ? WHERE id = ?',
+        [adviserInstitutionId, project_id]
+      );
+    } else if (project.institution_id !== adviserInstitutionId) {
+      await conn.rollback();
+      return {
+        error: 'Project institution does not match adviser institution.',
+        status: 403,
+      };
+    }
+
     const scheduleCheck = await validateScheduleConstraints({
       projectId: project_id,
-      startTime: normalizedStart.dbValue,
-      endTime: normalizedEnd.dbValue,
-      startDate: normalizedStart.dateValue,
-      endDate: normalizedEnd.dateValue,
+      scheduledAt: normalizedSchedule.dbValue,
       location,
       fallbackTeacherId: userId,
       queryRunner: conn,
     });
 
-    let status = 'scheduled';
+    let status = submit_as_proposal ? 'pending' : 'scheduled';
     let blockedBy = null;
-    let hasOverlap = false;
-
     if (!scheduleCheck.ok) {
-      hasOverlap = true;
       const conflicts = scheduleCheck.conflicts;
-      const maxRemaining = Math.max(...conflicts.map(c => c.remaining_minutes));
-      const maxOverlap = Math.max(...conflicts.map(c => c.overlap_minutes));
-      const candidateTotalMinutes = Math.round(
-        (normalizedEnd.dateValue.getTime() - normalizedStart.dateValue.getTime()) / 60000
-      );
-      const effectiveMinutes = candidateTotalMinutes - maxOverlap;
-
-      // Compute the effective start time (after the overlap ends)
-      const latestConflictEndMs = Math.max(
-        ...conflicts.map(c => {
-          const end = new Date(c.remaining_minutes * 60000 + normalizedStart.dateValue.getTime());
-          return end.getTime();
-        })
-      );
-      const effectiveStartDb = formatDateToDbUtc(new Date(latestConflictEndMs));
-
-      // Only allow overlap if the remaining time after deduction is above 10 mins
-      if (effectiveMinutes <= 10) {
-        await conn.rollback();
-        return {
-          error: `Schedule conflict: after deducting the overlap, only ${effectiveMinutes} minutes would remain (must be above 10 minutes). Please choose a different time.`,
-          status: 409,
-        };
-      }
-
-      // User confirmed the overlap — proceed as scheduled with partial_time
-      if (force_partial) {
-        status = 'scheduled';
-      }
-      // User opted to wait (pending) — will auto-promote when blocking meeting ends/cancels
-      else if (force_pending) {
+      if (force_pending || submit_as_proposal) {
         status = 'pending';
         blockedBy = conflicts[0].defense_id;
-      }
-      // Conflict exists but user hasn't confirmed yet — return conflict details
-      else {
+      } else {
         await conn.rollback();
         return {
           conflict: true,
           conflicts,
-          max_overlap_minutes: maxOverlap,
-          max_remaining_minutes: maxRemaining,
-          candidate_total_minutes: candidateTotalMinutes,
-          effective_minutes: effectiveMinutes,
-          effective_start_time: effectiveStartDb,
-          message: 'Schedule conflict detected. Please confirm how to proceed.',
+          message: 'Schedule conflict detected for this datetime. Please choose another time or set force_pending.',
           status: 409,
         };
       }
@@ -368,11 +281,11 @@ async function createDefense(userId, payload) {
 
     const [idRows] = await conn.execute('SELECT UUID() AS id');
     const defenseId = idRows[0].id;
- 
+
     await conn.execute(
-      `INSERT INTO defenses (id, project_id, section, defense_type, start_time, end_time, location, partial_time, status, blocked_by, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [defenseId, project_id, section, defense_type, normalizedStart.dbValue, normalizedEnd.dbValue, location, hasOverlap ? 1 : 0, status, blockedBy, userId]
+      `INSERT INTO defenses (id, project_id, defense_type, scheduled_at, location, modality, status, blocked_by, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [defenseId, project_id, defense_type, normalizedSchedule.dbValue, location, modality || 'Online', status, blockedBy, userId]
     );
 
     const [rows] = await conn.execute(
@@ -382,9 +295,11 @@ async function createDefense(userId, payload) {
 
     await conn.commit();
 
-    // After booking, scan all pending defenses for potential promotion
-    await processAllPendingDefenses();
- 
+    // Adviser proposals should stay pending for coordinator review.
+    if (!submit_as_proposal) {
+      await processAllPendingDefenses();
+    }
+
     return { data: rows[0] };
   } catch (err) {
     if (conn) {
@@ -400,7 +315,7 @@ async function createDefense(userId, payload) {
     if (conn) conn.release();
   }
 }
- 
+
 async function getDefensesByUser(userId) {
   const { rows } = await db.query(
     `SELECT d.*, p.title AS project_title, p.project_code,
@@ -415,7 +330,21 @@ async function getDefensesByUser(userId) {
      FROM defenses d
      LEFT JOIN projects p ON d.project_id = p.id
      WHERE d.created_by = ?
-     ORDER BY d.start_time DESC`,
+     ORDER BY d.scheduled_at DESC`,
+    [userId]
+  );
+  return rows;
+}
+
+async function getDefensesForMember(userId) {
+  const { rows } = await db.query(
+    `SELECT d.*, p.title AS project_title, p.project_code,
+            u.full_name AS created_by_name
+     FROM defenses d
+     JOIN projects p ON d.project_id = p.id
+     JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = ?
+     LEFT JOIN users u ON d.created_by = u.id
+     ORDER BY d.scheduled_at DESC`,
     [userId]
   );
   return rows;
@@ -449,10 +378,7 @@ async function cancelDefense(userId, defenseId) {
     [defenseId]
   );
 
-  // Auto-promote: find any pending defenses that were blocked by this one
   await promotePendingDefenses(defenseId);
-
-  // Then scan all pending defenses globally
   await processAllPendingDefenses();
 
   const { rows: updatedRows } = await db.query(
@@ -475,8 +401,6 @@ async function cancelDefense(userId, defenseId) {
   return { data: updatedRows[0] || null };
 }
 
-// When a defense is cancelled, auto-promote any pending defenses that were
-// waiting on it, provided they no longer have conflicts.
 async function promotePendingDefenses(cancelledDefenseId) {
   const { rows: pendingRows } = await db.query(
     `SELECT * FROM defenses WHERE blocked_by = ? AND status = 'pending'`,
@@ -484,16 +408,12 @@ async function promotePendingDefenses(cancelledDefenseId) {
   );
 
   for (const pending of pendingRows) {
-    const normalizedStart = normalizeDateTimeInput(pending.start_time);
-    const normalizedEnd = normalizeDateTimeInput(pending.end_time);
-    if (!normalizedStart || !normalizedEnd) continue;
+    const normalizedSchedule = normalizeDateTimeInput(pending.scheduled_at);
+    if (!normalizedSchedule) continue;
 
     const recheck = await validateScheduleConstraints({
       projectId: pending.project_id,
-      startTime: normalizedStart.dbValue,
-      endTime: normalizedEnd.dbValue,
-      startDate: normalizedStart.dateValue,
-      endDate: normalizedEnd.dateValue,
+      scheduledAt: normalizedSchedule.dbValue,
       location: pending.location,
       fallbackTeacherId: pending.created_by,
     });
@@ -507,10 +427,6 @@ async function promotePendingDefenses(cancelledDefenseId) {
   }
 }
 
-// After any booking / cancellation / reschedule, scan ALL pending defenses
-// ordered by created_at and try to promote them one-by-one inside a
-// SERIALIZABLE transaction so that competing defenses for the same slot
-// are resolved first-come-first-served.
 async function processAllPendingDefenses() {
   let conn;
   try {
@@ -523,16 +439,12 @@ async function processAllPendingDefenses() {
     );
 
     for (const pending of pendingRows) {
-      const normalizedStart = normalizeDateTimeInput(pending.start_time);
-      const normalizedEnd = normalizeDateTimeInput(pending.end_time);
-      if (!normalizedStart || !normalizedEnd) continue;
+      const normalizedSchedule = normalizeDateTimeInput(pending.scheduled_at);
+      if (!normalizedSchedule) continue;
 
       const recheck = await validateScheduleConstraints({
         projectId: pending.project_id,
-        startTime: normalizedStart.dbValue,
-        endTime: normalizedEnd.dbValue,
-        startDate: normalizedStart.dateValue,
-        endDate: normalizedEnd.dateValue,
+        scheduledAt: normalizedSchedule.dbValue,
         location: pending.location,
         fallbackTeacherId: pending.created_by,
         queryRunner: conn,
@@ -549,7 +461,11 @@ async function processAllPendingDefenses() {
     await conn.commit();
   } catch (err) {
     if (conn) {
-      try { await conn.rollback(); } catch (e) { console.error('processAllPending rollback error:', e); }
+      try {
+        await conn.rollback();
+      } catch (e) {
+        console.error('processAllPending rollback error:', e);
+      }
     }
     console.error('processAllPendingDefenses error:', err);
   } finally {
@@ -580,17 +496,11 @@ async function rescheduleDefense(userId, defenseId, payload) {
     return { error: 'Cannot reschedule a cancelled meeting', status: 409 };
   }
 
-  const { start_time, end_time } = payload;
-  if (!start_time) return { error: 'start_time is required' };
-  if (!end_time) return { error: 'end_time is required' };
+  const scheduleInput = payload.scheduled_at;
+  if (!scheduleInput) return { error: 'scheduled_at is required' };
 
-  const normalizedStart = normalizeDateTimeInput(start_time);
-  const normalizedEnd = normalizeDateTimeInput(end_time);
-  if (!normalizedStart) return { error: 'start_time must be a valid datetime value' };
-  if (!normalizedEnd) return { error: 'end_time must be a valid datetime value' };
-  if (normalizedStart.dateValue.getTime() >= normalizedEnd.dateValue.getTime()) {
-    return { error: 'end_time must be after start_time' };
-  }
+  const normalizedSchedule = normalizeDateTimeInput(scheduleInput);
+  if (!normalizedSchedule) return { error: 'scheduled_at must be a valid datetime value' };
 
   let conn;
   try {
@@ -598,7 +508,6 @@ async function rescheduleDefense(userId, defenseId, payload) {
     await conn.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
     await conn.beginTransaction();
 
-    // Temporarily mark the current defense as cancelled so it doesn't conflict with itself
     await conn.execute(
       `UPDATE defenses SET status = 'cancelled' WHERE id = ?`,
       [defenseId]
@@ -606,10 +515,7 @@ async function rescheduleDefense(userId, defenseId, payload) {
 
     const scheduleCheck = await validateScheduleConstraints({
       projectId: defense.project_id,
-      startTime: normalizedStart.dbValue,
-      endTime: normalizedEnd.dbValue,
-      startDate: normalizedStart.dateValue,
-      endDate: normalizedEnd.dateValue,
+      scheduledAt: normalizedSchedule.dbValue,
       location: defense.location,
       fallbackTeacherId: userId,
       queryRunner: conn,
@@ -617,26 +523,17 @@ async function rescheduleDefense(userId, defenseId, payload) {
 
     if (!scheduleCheck.ok) {
       await conn.rollback();
-      const maxRemaining = Math.max(...scheduleCheck.conflicts.map(c => c.remaining_minutes));
-      if (maxRemaining <= 10) {
-        return {
-          error: 'Schedule conflict: an existing meeting occupies this slot with 10 minutes or less remaining.',
-          status: 409,
-        };
-      }
       return {
         conflict: true,
         conflicts: scheduleCheck.conflicts,
-        max_overlap_minutes: Math.max(...scheduleCheck.conflicts.map(c => c.overlap_minutes)),
-        max_remaining_minutes: maxRemaining,
-        message: 'Rescheduled time has conflicts.',
+        message: 'Rescheduled datetime has conflicts.',
         status: 409,
       };
     }
 
     await conn.execute(
-      `UPDATE defenses SET start_time = ?, end_time = ?, status = 'rescheduled', blocked_by = NULL WHERE id = ?`,
-      [normalizedStart.dbValue, normalizedEnd.dbValue, defenseId]
+      `UPDATE defenses SET scheduled_at = ?, status = 'rescheduled', blocked_by = NULL WHERE id = ?`,
+      [normalizedSchedule.dbValue, defenseId]
     );
 
     const [updatedRows] = await conn.execute(
@@ -645,14 +542,16 @@ async function rescheduleDefense(userId, defenseId, payload) {
     );
 
     await conn.commit();
-
-    // After reschedule, scan all pending defenses for potential promotion
     await processAllPendingDefenses();
 
     return { data: updatedRows[0] };
   } catch (err) {
     if (conn) {
-      try { await conn.rollback(); } catch (e) { console.error('reschedule rollback error:', e); }
+      try {
+        await conn.rollback();
+      } catch (e) {
+        console.error('reschedule rollback error:', e);
+      }
     }
     console.error('rescheduleDefense error:', err);
     throw err;
@@ -660,5 +559,5 @@ async function rescheduleDefense(userId, defenseId, payload) {
     if (conn) conn.release();
   }
 }
- 
-module.exports = { createDefense, getDefensesByUser, cancelDefense, rescheduleDefense };
+
+module.exports = { createDefense, getDefensesByUser, getDefensesForMember, cancelDefense, rescheduleDefense };

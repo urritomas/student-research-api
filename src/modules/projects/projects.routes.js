@@ -35,5 +35,6 @@ router.get('/:id/files', asyncHandler(controller.getFiles));
 router.get('/:id/invitations', asyncHandler(controller.getInvitations));
 router.post('/:id/invite', asyncHandler(controller.invite));
 router.post('/:id/schedule', asyncHandler(controller.scheduleDefense));
+router.patch('/:id/status', asyncHandler(controller.updateStatus));
 
 module.exports = router;

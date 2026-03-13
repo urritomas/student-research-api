@@ -159,7 +159,9 @@ async function getPendingDefenses(institutionId) {
      FROM defenses d
      INNER JOIN projects p ON d.project_id = p.id
      LEFT JOIN users u ON d.created_by = u.id
-     WHERE p.institution_id = ? AND d.status = 'pending'
+     WHERE p.institution_id = ?
+       AND d.verified_by IS NULL
+       AND d.status IN ('pending', 'scheduled')
      ORDER BY d.scheduled_at ASC`,
     [institutionId]
   );
@@ -354,7 +356,9 @@ async function getCoordinatorStats(institutionId) {
     db.query(
       `SELECT COUNT(*) AS count FROM defenses d
        INNER JOIN projects p ON d.project_id = p.id
-       WHERE p.institution_id = ? AND d.status = 'pending'`,
+       WHERE p.institution_id = ?
+         AND d.verified_by IS NULL
+         AND d.status IN ('pending', 'scheduled')`,
       [institutionId]
     ),
     db.query(

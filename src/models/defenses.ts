@@ -7,16 +7,13 @@ export interface Defense {
   id: string; // uuid
   project_id: string; // uuid
   defense_type: DefenseTypeEnum;
-  start_time: Date; // datetime
-  end_time: Date; // datetime
+  scheduled_at: Date; // datetime
   location: string; // varchar(255)
   rubric_id?: string; // uuid (nullable)
   status: DefenseStatusEnum;
-  partial_time: boolean; // tinyint(1)
-  section?: string; // varchar(255) (nullable)
+  modality?: string; // varchar(50) (nullable)
   created_by: string; // uuid
   created_at?: Date; // timestamp
-  updated_at?: Date; // timestamp
 }
  
 export default Defense;

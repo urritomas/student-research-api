@@ -2,9 +2,10 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const { uploadBase } = require('../../config/env');
 
-const AVATARS_DIR = path.join(__dirname, '..', '..', 'uploads', 'avatars');
-const FILES_DIR = path.join(__dirname, '..', '..', 'uploads', 'files');
+const AVATARS_DIR = path.join(uploadBase, 'avatars');
+const FILES_DIR = path.join(uploadBase, 'files');
 
 function ensureDir(dir) {
   try {

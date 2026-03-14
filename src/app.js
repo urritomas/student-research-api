@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const { corsOrigins, uploadBase, trustProxy, isProduction } = require('../config/env');
+const { corsOrigins, isCorsOriginAllowed, uploadBase, trustProxy, isProduction } = require('../config/env');
 const usersRouter = require('./modules/users/users.routes');
 const userRouter = require('./modules/user/user.routes');
 const authRouter = require('./modules/auth/auth.routes');
@@ -28,7 +28,7 @@ const corsOptions = {
       return;
     }
 
-    if (corsOrigins.includes(origin)) {
+    if (isCorsOriginAllowed(origin)) {
       callback(null, true);
       return;
     }

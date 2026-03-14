@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const path = require('path');
 const {
   corsOrigins,
   uploadBase,
@@ -55,9 +56,17 @@ app.use(cors(corsOptions));
 
 app.use(express.json({ limit: '10mb' })); // For parsing application/json (allow base64 payloads)
 app.use(express.urlencoded({ extended: true, limit: '10mb' })); // For parsing application/x-www-form-urlencoded
+const legacyUploadBase = path.join(__dirname, '..', 'uploads');
+
 app.use('/uploads', express.static(uploadBase, {
   maxAge: isProduction ? '1d' : 0,
 }));
+
+if (legacyUploadBase !== uploadBase) {
+  app.use('/uploads', express.static(legacyUploadBase, {
+    maxAge: isProduction ? '1d' : 0,
+  }));
+}
 
 app.get('/health', (_req, res) => {
   res.status(200).json({

@@ -1,6 +1,35 @@
 const db = require('../../../config/db');
 const { createNotification } = require('../notifications/notifications.service');
 
+let defenseScheduleExprCache = null;
+
+async function getDefenseScheduleExpr() {
+  if (defenseScheduleExprCache) {
+    return defenseScheduleExprCache;
+  }
+
+  const { rows } = await db.query(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'defenses'`
+  );
+
+  const columns = new Set(rows.map((row) => row.COLUMN_NAME));
+  const scheduleCandidates = [];
+
+  if (columns.has('scheduled_at')) scheduleCandidates.push('d.scheduled_at');
+  if (columns.has('verified_schedule')) scheduleCandidates.push('d.verified_schedule');
+  if (columns.has('proposed_schedule')) scheduleCandidates.push('d.proposed_schedule');
+  scheduleCandidates.push('d.created_at');
+
+  defenseScheduleExprCache = scheduleCandidates.length === 1
+    ? scheduleCandidates[0]
+    : `COALESCE(${scheduleCandidates.join(', ')})`;
+
+  return defenseScheduleExprCache;
+}
+
 // ─── Institution Management ─────────────────────────────────────────────────
 
 async function getInstitutionByCoordinator(userId) {
@@ -153,8 +182,11 @@ async function deleteCourse(courseId, institutionId) {
 // ─── Defense Verification ───────────────────────────────────────────────────
 
 async function getPendingDefenses(institutionId) {
+  const scheduleExpr = await getDefenseScheduleExpr();
+
   const { rows } = await db.query(
     `SELECT d.*, p.title AS project_title, p.project_code,
+            ${scheduleExpr} AS scheduled_at,
             u.full_name AS created_by_name
      FROM defenses d
      INNER JOIN projects p ON d.project_id = p.id
@@ -162,15 +194,18 @@ async function getPendingDefenses(institutionId) {
      WHERE p.institution_id = ?
        AND d.verified_by IS NULL
        AND d.status IN ('pending', 'scheduled')
-     ORDER BY d.scheduled_at ASC`,
+     ORDER BY ${scheduleExpr} ASC`,
     [institutionId]
   );
   return rows;
 }
 
 async function getAllDefensesForInstitution(institutionId) {
+  const scheduleExpr = await getDefenseScheduleExpr();
+
   const { rows } = await db.query(
     `SELECT d.*, p.title AS project_title, p.project_code,
+            ${scheduleExpr} AS scheduled_at,
             u.full_name AS created_by_name,
             vu.full_name AS verified_by_name
      FROM defenses d
@@ -178,7 +213,7 @@ async function getAllDefensesForInstitution(institutionId) {
      LEFT JOIN users u ON d.created_by = u.id
      LEFT JOIN users vu ON d.verified_by = vu.id
      WHERE p.institution_id = ?
-     ORDER BY d.scheduled_at DESC`,
+     ORDER BY ${scheduleExpr} DESC`,
     [institutionId]
   );
   return rows;

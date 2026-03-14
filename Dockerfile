@@ -29,5 +29,5 @@ RUN mkdir -p /app/uploads/avatars && chown -R node:node /app/uploads
 # Expose the port the app runs on
 EXPOSE 4000
 
-# Default CMD — overridden by docker-compose entrypoint in dev
-CMD ["node", "src/server.js"]
+# Default CMD — use package start script so migrations run before server start
+CMD ["pnpm", "start"]

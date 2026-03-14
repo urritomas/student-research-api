@@ -1,7 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const { corsOrigins, uploadBase, trustProxy, isProduction } = require('../config/env');
+const {
+  corsOrigins,
+  uploadBase,
+  trustProxy,
+  isProduction,
+  normalizeOrigin,
+} = require('../config/env');
 const usersRouter = require('./modules/users/users.routes');
 const userRouter = require('./modules/user/user.routes');
 const authRouter = require('./modules/auth/auth.routes');
@@ -28,9 +34,14 @@ const corsOptions = {
       return;
     }
 
-    if (corsOrigins.includes(origin)) {
+    const requestOrigin = normalizeOrigin(origin);
+    if (requestOrigin && corsOrigins.includes(requestOrigin)) {
       callback(null, true);
       return;
+    }
+
+    if (!isProduction) {
+      console.warn('[cors] Denied origin:', origin, 'Allowed:', corsOrigins);
     }
 
     callback(new Error('Not allowed by CORS'));

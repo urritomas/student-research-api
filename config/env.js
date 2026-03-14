@@ -2,11 +2,31 @@ const path = require('path');
 
 const isProduction = process.env.NODE_ENV === 'production';
 
+function normalizeOrigin(value) {
+  if (!value) return null;
+
+  const raw = String(value).trim().replace(/\/+$/, '');
+  if (!raw) return null;
+
+  // Accept common deployment values entered without a protocol.
+  const withProtocol = /^https?:\/\//i.test(raw)
+    ? raw
+    : `${/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(raw) ? 'http' : 'https'}://${raw}`;
+
+  try {
+    const parsed = new URL(withProtocol);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
 function parseCsv(value) {
   if (!value) return [];
   return value
     .split(',')
-    .map((item) => item.trim())
+    .map((item) => normalizeOrigin(item))
     .filter(Boolean);
 }
 
@@ -22,9 +42,9 @@ function parseTrustProxy(value) {
 
 const corsOrigins = Array.from(new Set([
   ...parseCsv(process.env.CORS_ORIGINS),
-  process.env.CLIENT_URL,
-  process.env.WEB_ORIGIN,
-  ...(isProduction ? [] : ['http://localhost:3000', 'http://localhost:3001']),
+  normalizeOrigin(process.env.CLIENT_URL),
+  normalizeOrigin(process.env.WEB_ORIGIN),
+  ...(isProduction ? [] : ['http://localhost:3000', 'http://localhost:3001'].map(normalizeOrigin)),
 ].filter(Boolean)));
 
 const uploadBase = process.env.UPLOAD_PATH
@@ -53,6 +73,7 @@ function validateProductionEnv() {
 
 module.exports = {
   isProduction,
+  normalizeOrigin,
   corsOrigins,
   uploadBase,
   trustProxy,

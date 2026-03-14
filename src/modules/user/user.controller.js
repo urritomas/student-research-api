@@ -34,4 +34,15 @@ async function uploadAvatar(req, res) {
   return res.json({ publicUrl, profile: result.data });
 }
 
-module.exports = { getProfile, patchProfile, uploadAvatar };
+async function uploadAvatarSafe(req, res) {
+  try {
+    return await uploadAvatar(req, res);
+  } catch (err) {
+    if (['EACCES', 'EPERM', 'EROFS', 'ENOSPC'].includes(err?.code)) {
+      return res.status(500).json({ error: 'Failed to write uploaded file to disk' });
+    }
+    throw err;
+  }
+}
+
+module.exports = { getProfile, patchProfile, uploadAvatar: uploadAvatarSafe };

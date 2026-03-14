@@ -1,6 +1,10 @@
 const express = require('express');
 const { requireAuth } = require('../../middleware/auth');
-const { createAvatarUpload } = require('../../middleware/multer');
+const {
+  createAvatarUpload,
+  getUploadErrorStatus,
+  getUploadErrorMessage,
+} = require('../../middleware/multer');
 const { uploadAvatar, uploadCropped } = require('./upload.controller');
 
 const router = express.Router();
@@ -15,8 +19,7 @@ function handleAvatarUpload(req, res, next) {
   const upload = createAvatarUpload();
   upload(req, res, (err) => {
     if (err) {
-      const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
-      return res.status(status).json({ error: err.message || 'File upload failed' });
+      return res.status(getUploadErrorStatus(err)).json({ error: getUploadErrorMessage(err) });
     }
     next();
   });

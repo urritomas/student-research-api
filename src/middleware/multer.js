@@ -10,14 +10,46 @@ const FILES_DIR = path.join(uploadBase, 'files');
 function ensureDir(dir) {
   try {
     if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
     }
-    // quick access test
-    fs.accessSync(dir, fs.constants.W_OK);
+
+    // Ensure folder can be traversed and written by the app process.
+    fs.accessSync(dir, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
+
+    // Probe write to fail early if volume is mounted read-only or full.
+    const probeFile = path.join(dir, `.upload-probe-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(probeFile, 'ok');
+    fs.unlinkSync(probeFile);
   } catch (err) {
     console.error('Failed to create or access upload directory', dir, err);
+    err.code = err.code || 'UPLOAD_DIR_UNAVAILABLE';
     throw err;
   }
+}
+
+function makeFilename(req, file, fallbackExt) {
+  const userId = req.user?.id || 'unknown';
+  const ext = path.extname(file.originalname).toLowerCase() || fallbackExt;
+  const unique = crypto.randomBytes(8).toString('hex');
+  return `${userId}-${Date.now()}-${unique}${ext}`;
+}
+
+function getUploadErrorStatus(err) {
+  if (!err) return 400;
+  if (err.code === 'LIMIT_FILE_SIZE') return 413;
+
+  const diskCodes = ['EACCES', 'EPERM', 'EROFS', 'ENOSPC', 'UPLOAD_DIR_UNAVAILABLE'];
+  if (diskCodes.includes(err.code)) return 500;
+
+  return 400;
+}
+
+function getUploadErrorMessage(err) {
+  const status = getUploadErrorStatus(err);
+  if (status === 500) {
+    return 'Failed to write file to disk. Please try again later.';
+  }
+  return err?.message || 'File upload failed';
 }
 
 function createAvatarUpload() {
@@ -25,13 +57,15 @@ function createAvatarUpload() {
 
   const storage = multer.diskStorage({
     destination: (_req, _file, cb) => {
-      cb(null, AVATARS_DIR);
+      try {
+        ensureDir(AVATARS_DIR);
+        cb(null, AVATARS_DIR);
+      } catch (err) {
+        cb(err);
+      }
     },
     filename: (req, file, cb) => {
-      const userId = req.user?.id || 'unknown';
-      const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
-      const unique = crypto.randomBytes(8).toString('hex');
-      cb(null, `${userId}-${Date.now()}-${unique}${ext}`);
+      cb(null, makeFilename(req, file, '.jpg'));
     },
   });
 
@@ -63,13 +97,15 @@ function createDocumentUpload() {
 
   const storage = multer.diskStorage({
     destination: (_req, _file, cb) => {
-      cb(null, FILES_DIR);
+      try {
+        ensureDir(FILES_DIR);
+        cb(null, FILES_DIR);
+      } catch (err) {
+        cb(err);
+      }
     },
     filename: (req, file, cb) => {
-      const userId = req.user?.id || 'unknown';
-      const ext = path.extname(file.originalname).toLowerCase() || '.pdf';
-      const unique = crypto.randomBytes(8).toString('hex');
-      cb(null, `${userId}-${Date.now()}-${unique}${ext}`);
+      cb(null, makeFilename(req, file, '.pdf'));
     },
   });
 
@@ -99,4 +135,9 @@ function createDocumentUpload() {
   }).single('file');
 }
 
-module.exports = { createAvatarUpload, createDocumentUpload };
+module.exports = {
+  createAvatarUpload,
+  createDocumentUpload,
+  getUploadErrorStatus,
+  getUploadErrorMessage,
+};

@@ -2,18 +2,30 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const sharp = require('sharp');
+const { uploadBase } = require('../../../config/env');
 
-const UPLOADS_DIR = path.join(__dirname, '..', '..', '..', 'uploads', 'avatars');
+const UPLOADS_DIR = path.join(uploadBase, 'avatars');
 
 function ensureUploadsDir() {
   try {
     if (!fs.existsSync(UPLOADS_DIR)) {
-      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true, mode: 0o755 });
     }
-    fs.accessSync(UPLOADS_DIR, fs.constants.W_OK);
+    fs.accessSync(UPLOADS_DIR, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
   } catch (err) {
     console.error('Unable to create or write to uploads dir', UPLOADS_DIR, err);
     throw err;
+  }
+}
+
+function trySetFileMode(filePath) {
+  try {
+    fs.chmodSync(filePath, 0o644);
+  } catch (err) {
+    // Non-fatal on platforms that ignore POSIX mode bits.
+    if (err && err.code !== 'ENOSYS') {
+      console.warn('Unable to set file mode for upload', filePath, err.message);
+    }
   }
 }
 
@@ -25,7 +37,7 @@ async function uploadAvatar(req, res) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    const fullPath = path.join(UPLOADS_DIR, req.file.filename);
+    const fullPath = req.file.path || path.join(UPLOADS_DIR, req.file.filename);
 
     // Validate image integrity by probing with sharp
     try {
@@ -37,10 +49,15 @@ async function uploadAvatar(req, res) {
       return res.status(400).json({ error: 'Uploaded image is corrupt or invalid' });
     }
 
+    trySetFileMode(fullPath);
+
     const publicUrl = `/uploads/avatars/${req.file.filename}`;
     return res.json({ publicUrl });
   } catch (err) {
     console.error('uploadAvatar error', err);
+    if (['EACCES', 'EPERM', 'EROFS', 'ENOSPC'].includes(err.code)) {
+      return res.status(500).json({ error: 'Failed to write uploaded file to disk' });
+    }
     return res.status(500).json({ error: 'Failed to process upload' });
   }
 }
@@ -75,8 +92,12 @@ async function uploadCropped(req, res) {
         .resize(512, 512, { fit: 'cover' })
         .webp({ quality: 85 })
         .toFile(dest);
+      trySetFileMode(dest);
     } catch (err) {
       console.error('Failed to process cropped image', err);
+      if (['EACCES', 'EPERM', 'EROFS', 'ENOSPC'].includes(err.code)) {
+        return res.status(500).json({ error: 'Failed to write uploaded file to disk' });
+      }
       return res.status(400).json({ error: 'Failed to process image' });
     }
 

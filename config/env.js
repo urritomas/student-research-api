@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -47,9 +48,21 @@ const corsOrigins = Array.from(new Set([
   ...(isProduction ? [] : ['http://localhost:3000', 'http://localhost:3001'].map(normalizeOrigin)),
 ].filter(Boolean)));
 
-const uploadBase = process.env.UPLOAD_PATH
-  ? path.resolve(process.env.UPLOAD_PATH)
-  : path.join(__dirname, '..', 'uploads');
+function resolveUploadBase() {
+  if (process.env.UPLOAD_PATH) {
+    return path.resolve(process.env.UPLOAD_PATH);
+  }
+
+  // Railway volume default mount point.
+  const railwayVolumePath = '/mnt/uploads';
+  if (isProduction && fs.existsSync(railwayVolumePath)) {
+    return railwayVolumePath;
+  }
+
+  return path.join(__dirname, '..', 'uploads');
+}
+
+const uploadBase = resolveUploadBase();
 
 const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
 

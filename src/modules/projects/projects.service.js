@@ -334,14 +334,14 @@ async function createDefenseSchedule({ projectId, defenseType, scheduledAt, loca
     await conn.beginTransaction();
 
     await conn.execute(
-      `INSERT INTO defenses (project_id, defense_type, scheduled_at, location, status, created_by)
+      `INSERT INTO defenses (project_id, defense_type, start_time, location, status, created_by)
        VALUES (?, ?, ?, ?, 'scheduled', ?)`,
       [projectId, defenseType, scheduledAt, location || null, createdBy]
     );
 
     const [rows] = await conn.execute(
       `SELECT * FROM defenses
-       WHERE project_id = ? AND defense_type = ? AND scheduled_at = ? AND created_by = ?
+       WHERE project_id = ? AND defense_type = ? AND start_time = ? AND created_by = ?
        ORDER BY created_at DESC
        LIMIT 1`,
       [projectId, defenseType, scheduledAt, createdBy]

@@ -7,7 +7,8 @@ export interface Defense {
   id: string; // uuid
   project_id: string; // uuid
   defense_type: DefenseTypeEnum;
-  scheduled_at: Date; // datetime
+  start_time: Date; // datetime
+  end_time?: Date; // datetime (nullable)
   location: string; // varchar(255)
   rubric_id?: string; // uuid (nullable)
   status: DefenseStatusEnum;

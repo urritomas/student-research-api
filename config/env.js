@@ -2,38 +2,11 @@ const path = require('path');
 
 const isProduction = process.env.NODE_ENV === 'production';
 
-function sanitizeEnvValue(value) {
-  if (typeof value !== 'string') return '';
-  const trimmed = value.trim();
-  if (!trimmed) return '';
-
-  const startsWithQuote = trimmed.startsWith('"') || trimmed.startsWith("'");
-  const endsWithQuote = trimmed.endsWith('"') || trimmed.endsWith("'");
-  if (startsWithQuote && endsWithQuote && trimmed.length >= 2) {
-    return trimmed.slice(1, -1).trim();
-  }
-
-  return trimmed;
-}
-
-function normalizeOrigin(value) {
-  const sanitized = sanitizeEnvValue(value);
-  if (!sanitized) return '';
-
-  const withoutTrailingSlash = sanitized.replace(/\/+$/, '');
-  try {
-    return new URL(withoutTrailingSlash).origin;
-  } catch {
-    // Keep non-URL values as-is; this preserves backward compatibility.
-    return withoutTrailingSlash;
-  }
-}
-
 function parseCsv(value) {
   if (!value) return [];
   return value
     .split(',')
-    .map((item) => normalizeOrigin(item))
+    .map((item) => item.trim())
     .filter(Boolean);
 }
 
@@ -49,28 +22,10 @@ function parseTrustProxy(value) {
 
 const corsOrigins = Array.from(new Set([
   ...parseCsv(process.env.CORS_ORIGINS),
-  normalizeOrigin(process.env.CLIENT_URL),
-  normalizeOrigin(process.env.WEB_ORIGIN),
+  process.env.CLIENT_URL,
+  process.env.WEB_ORIGIN,
   ...(isProduction ? [] : ['http://localhost:3000', 'http://localhost:3001']),
 ].filter(Boolean)));
-
-function isCorsOriginAllowed(origin) {
-  const normalizedOrigin = normalizeOrigin(origin);
-  if (!normalizedOrigin) return false;
-
-  if (corsOrigins.includes(normalizedOrigin)) {
-    return true;
-  }
-
-  // If any Vercel domain is configured, allow other Vercel subdomains
-  // (e.g. preview URLs like *-git-main-*.vercel.app).
-  const hasConfiguredVercelOrigin = corsOrigins.some((allowed) => /\.vercel\.app$/i.test(allowed));
-  if (hasConfiguredVercelOrigin && /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(normalizedOrigin)) {
-    return true;
-  }
-
-  return false;
-}
 
 const uploadBase = process.env.UPLOAD_PATH
   ? path.resolve(process.env.UPLOAD_PATH)
@@ -99,7 +54,6 @@ function validateProductionEnv() {
 module.exports = {
   isProduction,
   corsOrigins,
-  isCorsOriginAllowed,
   uploadBase,
   trustProxy,
   validateProductionEnv,

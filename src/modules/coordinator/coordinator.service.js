@@ -1,166 +1,6 @@
 const db = require('../../../config/db');
 const { createNotification } = require('../notifications/notifications.service');
 
-function toDate(value) {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-
-function normalizeDateTimeInput(value) {
-  const pad = (n) => String(n).padStart(2, '0');
-
-  if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    // Keep DATETIME values in local wall-clock form (no timezone shift).
-    return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
-  }
-
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-
-  // Preserve MySQL DATETIME wall-clock strings as-is.
-  const mysqlDateTime = /^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}(:\d{2})?$/;
-  if (mysqlDateTime.test(trimmed)) {
-    return trimmed.length === 16 ? `${trimmed}:00` : trimmed;
-  }
-
-  const localNoZone = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(:\d{2})?$/;
-  const localMatch = trimmed.match(localNoZone);
-  if (localMatch) {
-    const datePart = localMatch[1];
-    const timePart = localMatch[2];
-    const secondsPart = localMatch[3] || ':00';
-    return `${datePart} ${timePart}${secondsPart}`;
-  }
-
-  const parsed = toDate(trimmed);
-  if (!parsed) return null;
-
-  return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`;
-}
-
-function addMinutes(dbDateTime, minutes) {
-  if (!dbDateTime || !minutes) return dbDateTime || null;
-  const base = toDate(dbDateTime.toString().replace(' ', 'T'));
-  if (!base) return dbDateTime;
-  const next = new Date(base.getTime() + minutes * 60000);
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${next.getFullYear()}-${pad(next.getMonth() + 1)}-${pad(next.getDate())} ${pad(next.getHours())}:${pad(next.getMinutes())}:${pad(next.getSeconds())}`;
-}
-
-async function getCoordinatorConflicts(conn, defense, candidateStart, candidateEnd, candidateLocation) {
-  const scheduleStatuses = ['approved', 'moved'];
-  const candidateStartDb = normalizeDateTimeInput(candidateStart);
-  const candidateEndDb = normalizeDateTimeInput(candidateEnd);
-  if (!candidateStartDb || !candidateEndDb) {
-    return { hasConflict: false, conflicts: [] };
-  }
-
-  const [membersRows] = await conn.execute(
-    `SELECT user_id
-     FROM project_members
-     WHERE project_id = ?
-       AND status = 'accepted'`,
-    [defense.project_id]
-  );
-
-  const memberIds = membersRows.map((row) => row.user_id);
-  const memberConflicts = memberIds.length
-    ? await (async () => {
-      const placeholders = memberIds.map(() => '?').join(', ');
-      const [rows] = await conn.execute(
-        `SELECT DISTINCT d.id, d.project_id, d.start_time, d.end_time, pm.user_id AS participant_id,
-                TIMESTAMPDIFF(MINUTE, GREATEST(d.start_time, ?), LEAST(COALESCE(d.end_time, d.start_time), ?)) AS overlap_minutes
-         FROM defenses d
-         JOIN project_members pm ON pm.project_id = d.project_id AND pm.status = 'accepted'
-         WHERE pm.user_id IN (${placeholders})
-           AND d.id != ?
-           AND d.status IN (${scheduleStatuses.map(() => '?').join(', ')})
-           AND d.start_time < ?
-           AND COALESCE(d.end_time, d.start_time) > ?`,
-          [candidateStartDb, candidateEndDb, ...memberIds, defense.id, ...scheduleStatuses, candidateEndDb, candidateStartDb]
-      );
-      return rows;
-    })()
-    : [];
-
-  const roomConflicts = (!candidateLocation || candidateLocation.toLowerCase() === 'online')
-    ? []
-    : await (async () => {
-      const [rows] = await conn.execute(
-        `SELECT d.id, d.project_id, d.start_time, d.end_time,
-                TIMESTAMPDIFF(MINUTE, GREATEST(d.start_time, ?), LEAST(COALESCE(d.end_time, d.start_time), ?)) AS overlap_minutes
-         FROM defenses d
-         WHERE d.id != ?
-           AND COALESCE(d.venue, d.location) = ?
-           AND d.status IN (${scheduleStatuses.map(() => '?').join(', ')})
-           AND d.start_time < ?
-           AND COALESCE(d.end_time, d.start_time) > ?`,
-          [candidateStartDb, candidateEndDb, defense.id, candidateLocation, ...scheduleStatuses, candidateEndDb, candidateStartDb]
-      );
-      return rows;
-    })();
-
-  const adviserConflicts = await (async () => {
-    const [rows] = await conn.execute(
-      `SELECT d.id, d.project_id, d.start_time, d.end_time,
-              TIMESTAMPDIFF(MINUTE, GREATEST(d.start_time, ?), LEAST(COALESCE(d.end_time, d.start_time), ?)) AS overlap_minutes
-       FROM defenses d
-       WHERE d.id != ?
-         AND d.created_by = ?
-         AND d.status IN (${scheduleStatuses.map(() => '?').join(', ')})
-         AND d.start_time < ?
-         AND COALESCE(d.end_time, d.start_time) > ?`,
-      [candidateStartDb, candidateEndDb, defense.id, defense.created_by, ...scheduleStatuses, candidateEndDb, candidateStartDb]
-    );
-    return rows;
-  })();
-
-  // Strict pre-check: any overlapping defense in the institution-level pool
-  // should prompt coordinator confirmation before approval.
-  const globalConflicts = await (async () => {
-    const [rows] = await conn.execute(
-      `SELECT d.id, d.project_id, d.start_time, d.end_time,
-              TIMESTAMPDIFF(MINUTE, GREATEST(d.start_time, ?), LEAST(COALESCE(d.end_time, d.start_time), ?)) AS overlap_minutes
-       FROM defenses d
-       WHERE d.id != ?
-         AND d.status IN (${scheduleStatuses.map(() => '?').join(', ')})
-         AND d.start_time < ?
-         AND COALESCE(d.end_time, d.start_time) > ?`,
-      [candidateStartDb, candidateEndDb, defense.id, ...scheduleStatuses, candidateEndDb, candidateStartDb]
-    );
-    return rows;
-  })();
-
-  const sameProjectConflicts = await (async () => {
-    const [rows] = await conn.execute(
-      `SELECT d.id, d.project_id, d.start_time, d.end_time,
-              TIMESTAMPDIFF(MINUTE, GREATEST(d.start_time, ?), LEAST(COALESCE(d.end_time, d.start_time), ?)) AS overlap_minutes
-       FROM defenses d
-       WHERE d.id != ?
-         AND d.project_id = ?
-         AND d.status IN (${scheduleStatuses.map(() => '?').join(', ')})
-         AND d.start_time < ?
-         AND COALESCE(d.end_time, d.start_time) > ?`,
-      [candidateStartDb, candidateEndDb, defense.id, defense.project_id, ...scheduleStatuses, candidateEndDb, candidateStartDb]
-    );
-    return rows;
-  })();
-
-  const conflicts = [
-    ...sameProjectConflicts.map((row) => ({ domain: 'project', defense_id: row.id, project_id: row.project_id, start_time: row.start_time, end_time: row.end_time, overlap_minutes: Number(row.overlap_minutes) || 0 })),
-    ...roomConflicts.map((row) => ({ domain: 'room', defense_id: row.id, project_id: row.project_id, start_time: row.start_time, end_time: row.end_time, overlap_minutes: Number(row.overlap_minutes) || 0 })),
-    ...adviserConflicts.map((row) => ({ domain: 'adviser', defense_id: row.id, project_id: row.project_id, start_time: row.start_time, end_time: row.end_time, overlap_minutes: Number(row.overlap_minutes) || 0 })),
-    ...memberConflicts.map((row) => ({ domain: 'participant', defense_id: row.id, project_id: row.project_id, start_time: row.start_time, end_time: row.end_time, participant_id: row.participant_id, overlap_minutes: Number(row.overlap_minutes) || 0 })),
-    ...globalConflicts.map((row) => ({ domain: 'global', defense_id: row.id, project_id: row.project_id, start_time: row.start_time, end_time: row.end_time, overlap_minutes: Number(row.overlap_minutes) || 0 })),
-  ];
-
-  return {
-    hasConflict: conflicts.length > 0,
-    conflicts,
-  };
-}
-
 // ─── Institution Management ─────────────────────────────────────────────────
 
 async function getInstitutionByCoordinator(userId) {
@@ -322,7 +162,7 @@ async function getPendingDefenses(institutionId) {
      WHERE p.institution_id = ?
        AND d.verified_by IS NULL
        AND d.status IN ('pending', 'scheduled')
-     ORDER BY d.start_time ASC`,
+     ORDER BY d.scheduled_at ASC`,
     [institutionId]
   );
   return rows;
@@ -338,23 +178,20 @@ async function getAllDefensesForInstitution(institutionId) {
      LEFT JOIN users u ON d.created_by = u.id
      LEFT JOIN users vu ON d.verified_by = vu.id
      WHERE p.institution_id = ?
-     ORDER BY d.start_time DESC`,
+     ORDER BY d.scheduled_at DESC`,
     [institutionId]
   );
   return rows;
 }
 
-async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule, verifiedEndTime, notes, forceApprove }) {
+async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule, notes }) {
   const conn = await db.pool.getConnection();
   try {
     await conn.beginTransaction();
 
     // Get current defense with project info
     const [defenseRows] = await conn.execute(
-      `SELECT d.*, 
-              DATE_FORMAT(d.start_time, '%Y-%m-%d %H:%i:%s') AS start_time_db,
-              DATE_FORMAT(d.end_time, '%Y-%m-%d %H:%i:%s') AS end_time_db,
-              p.title AS project_title
+      `SELECT d.*, p.title AS project_title
        FROM defenses d
        LEFT JOIN projects p ON d.project_id = p.id
        WHERE d.id = ? LIMIT 1`,
@@ -366,50 +203,8 @@ async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule
       return { error: 'Defense not found' };
     }
 
-    const normalizedVerifiedSchedule = verifiedSchedule ? normalizeDateTimeInput(verifiedSchedule) : null;
-    if (verifiedSchedule && !normalizedVerifiedSchedule) {
-      await conn.rollback();
-      return { error: 'verifiedSchedule must be a valid datetime value', status: 400 };
-    }
-
-    const normalizedVerifiedEndTime = verifiedEndTime ? normalizeDateTimeInput(verifiedEndTime) : null;
-    if (verifiedEndTime && !normalizedVerifiedEndTime) {
-      await conn.rollback();
-      return { error: 'verifiedEndTime must be a valid datetime value', status: 400 };
-    }
-
-    const finalStartTime = normalizedVerifiedSchedule || defense.start_time_db;
-    const scheduleMoved = !!normalizedVerifiedSchedule;
-
-    let finalEndTime = defense.end_time_db;
-    if (normalizedVerifiedEndTime) {
-      finalEndTime = normalizedVerifiedEndTime;
-    } else if (scheduleMoved && defense.start_time_db && defense.end_time_db) {
-      const oldStart = toDate(defense.start_time_db.replace(' ', 'T'));
-      const oldEnd = toDate(defense.end_time_db.replace(' ', 'T'));
-      if (oldStart && oldEnd) {
-        const durationMinutes = Math.max(0, Math.round((oldEnd.getTime() - oldStart.getTime()) / 60000));
-        finalEndTime = addMinutes(finalStartTime, durationMinutes);
-      }
-    }
-
-    if (!finalEndTime) {
-      finalEndTime = finalStartTime;
-    }
-
-    const candidateLocation = venue || defense.venue || defense.location;
-    const conflictCheck = await getCoordinatorConflicts(conn, defense, finalStartTime, finalEndTime, candidateLocation);
-    if (conflictCheck.hasConflict && !forceApprove) {
-      await conn.rollback();
-      return {
-        conflict: true,
-        conflicts: conflictCheck.conflicts,
-        message: 'This schedule conflicts with other confirmed defenses. Review and confirm override to continue.',
-        status: 409,
-      };
-    }
-
     // Determine status: 'moved' if schedule was changed, otherwise 'approved'
+    const scheduleMoved = verifiedSchedule && verifiedSchedule !== defense.scheduled_at?.toISOString?.();
     const newStatus = scheduleMoved ? 'moved' : 'approved';
     const notifType = scheduleMoved ? 'defense_moved' : 'defense_approved';
 
@@ -419,11 +214,9 @@ async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule
        SET verified_by = ?, verified_at = NOW(),
            venue = COALESCE(?, venue),
            verified_schedule = ?,
-           start_time = ?,
-           end_time = ?,
            status = ?
        WHERE id = ?`,
-      [coordinatorId, venue || null, finalStartTime, finalStartTime, finalEndTime, newStatus, defenseId]
+      [coordinatorId, venue || null, verifiedSchedule || defense.scheduled_at, newStatus, defenseId]
     );
 
     // Create verification audit record
@@ -433,8 +226,8 @@ async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule
       [
         defenseId,
         coordinatorId,
-        defense.start_time_db,
-        finalStartTime,
+        defense.scheduled_at,
+        verifiedSchedule || defense.scheduled_at,
         defense.venue || defense.location,
         venue || defense.venue || defense.location,
         notes || null,
@@ -447,7 +240,7 @@ async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule
       [defense.project_id]
     );
 
-    const finalSchedule = finalStartTime;
+    const finalSchedule = verifiedSchedule || defense.scheduled_at;
     const dateStr = new Date(finalSchedule).toLocaleDateString();
     const timeStr = new Date(finalSchedule).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const modality = defense.modality || 'Online';
@@ -610,7 +403,7 @@ async function createDefenseForCourse(institutionId, coordinatorId, payload) {
 
   for (const project of projects) {
     await db.query(
-      `INSERT INTO defenses (id, project_id, defense_type, start_time, location, venue, status, verified_by, verified_at, created_by)
+      `INSERT INTO defenses (id, project_id, defense_type, scheduled_at, location, venue, status, verified_by, verified_at, created_by)
        VALUES (UUID(), ?, ?, ?, ?, ?, 'scheduled', ?, NOW(), ?)`,
       [project.id, defenseType, scheduledAt, location, venue || null, coordinatorId, coordinatorId]
     );

@@ -2,21 +2,22 @@ const { createDefense, getDefensesByUser, getDefensesForMember, cancelDefense, r
 
 async function postDefense(req, res) {
   const result = await createDefense(req.user.id, req.body || {});
-  if (result.conflict) {
-    return res.status(409).json(result);
-  }
   if (result.error) {
     return res.status(result.status || 400).json({ error: result.error });
+  }
+  // Return conflict info so the frontend can prompt the user
+  if (result.conflict) {
+    return res.status(409).json(result);
   }
   return res.status(201).json(result.data);
 }
 
 async function postDefenseProposal(req, res) {
-  const result = await createDefense(req.user.id, req.body || {});
-
-  if (result.conflict) {
-    return res.status(409).json(result);
-  }
+  const result = await createDefense(req.user.id, {
+    ...(req.body || {}),
+    submit_as_proposal: true,
+    force_pending: true,
+  });
 
   if (result.error) {
     return res.status(result.status || 400).json({ error: result.error });
@@ -46,6 +47,9 @@ async function patchRescheduleDefense(req, res) {
   const result = await rescheduleDefense(req.user.id, req.params.id, req.body || {});
   if (result.error) {
     return res.status(result.status || 400).json({ error: result.error });
+  }
+  if (result.conflict) {
+    return res.status(409).json(result);
   }
   return res.json({
     success: true,

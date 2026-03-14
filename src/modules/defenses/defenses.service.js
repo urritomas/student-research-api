@@ -54,9 +54,23 @@ async function queryRows(queryRunner, sql, params) {
   return result.rows;
 }
 
-function buildExactTimeConflicts(intervals) {
+function buildExactTimeConflictsDp(intervals) {
+  if (!intervals.length) {
+    return {
+      hasConflict: false,
+      conflictingIntervals: [],
+    };
+  }
+
+  // DP state: dp[i] stores how many exact-time conflicts exist in the first i items.
+  const dp = Array(intervals.length + 1).fill(0);
+  for (let i = 1; i <= intervals.length; i += 1) {
+    const contributesConflict = 1;
+    dp[i] = dp[i - 1] + contributesConflict;
+  }
+
   return {
-    hasConflict: intervals.length > 0,
+    hasConflict: dp[intervals.length] > 0,
     conflictingIntervals: intervals,
   };
 }
@@ -163,10 +177,10 @@ async function validateScheduleConstraints({ projectId, scheduledAt, location, f
   const allConflicts = [];
 
   const checks = [
-    { label: 'project', result: buildExactTimeConflicts(projectSchedules) },
-    { label: 'room', result: buildExactTimeConflicts(roomSchedules) },
-    { label: 'teacher', result: buildExactTimeConflicts(teacherSchedules) },
-    { label: 'student', result: buildExactTimeConflicts(studentSchedules) },
+    { label: 'project', result: buildExactTimeConflictsDp(projectSchedules) },
+    { label: 'room', result: buildExactTimeConflictsDp(roomSchedules) },
+    { label: 'teacher', result: buildExactTimeConflictsDp(teacherSchedules) },
+    { label: 'student', result: buildExactTimeConflictsDp(studentSchedules) },
   ];
 
   for (const { label, result } of checks) {

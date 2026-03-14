@@ -11,6 +11,12 @@ function formatDateToDbUtc(date) {
 }
 
 function normalizeDateTimeInput(value) {
+  // mysql2 returns DATETIME columns as JS Date objects, handle them directly.
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    const pad = (n) => String(n).padStart(2, '0');
+    const dbValue = `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}`;
+    return { dbValue, dateValue: value };
+  }
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   if (!trimmed) return null;
@@ -48,70 +54,11 @@ async function queryRows(queryRunner, sql, params) {
   return result.rows;
 }
 
-// Dynamic Programming Algorithm:
-// Uses a difference array + prefix-sum state transition over discretized time points
-// to compute active occupancy per segment and detect overlap conflicts efficiently.
-function buildOccupancyDp(intervals, candidateStart, candidateEnd) {
-  if (!intervals.length) {
-    return { hasConflict: false, conflictingIntervals: [] };
-  }
-
-  const candidateStartMs = candidateStart.getTime();
-  const candidateEndMs = candidateEnd.getTime();
-
-  const pointsSet = new Set([candidateStartMs, candidateEndMs]);
-  const normalized = intervals
-    .map((interval) => {
-      const start = toDate(interval.start_time);
-      const end = toDate(interval.end_time);
-      if (!start || !end) return null;
-      return {
-        ...interval,
-        startMs: start.getTime(),
-        endMs: end.getTime(),
-      };
-    })
-    .filter((interval) => interval && interval.startMs < interval.endMs);
-
-  for (const interval of normalized) {
-    pointsSet.add(interval.startMs);
-    pointsSet.add(interval.endMs);
-  }
-
-  const points = Array.from(pointsSet).sort((a, b) => a - b);
-  const indexByPoint = new Map(points.map((point, index) => [point, index]));
-  const diff = Array(points.length).fill(0);
-
-  for (const interval of normalized) {
-    const startIndex = indexByPoint.get(interval.startMs);
-    const endIndex = indexByPoint.get(interval.endMs);
-    diff[startIndex] += 1;
-    diff[endIndex] -= 1;
-  }
-
-  // Prefix accumulation over segments gives active meeting count per timeslice.
-  let active = 0;
-  let hasConflict = false;
-  for (let i = 0; i < points.length - 1; i += 1) {
-    active += diff[i];
-    const segmentStart = points[i];
-    const segmentEnd = points[i + 1];
-    const intersectsCandidate = segmentEnd > candidateStartMs && segmentStart < candidateEndMs;
-    if (intersectsCandidate && active > 0) {
-      hasConflict = true;
-      break;
-    }
-  }
-
-  if (!hasConflict) {
-    return { hasConflict: false, conflictingIntervals: [] };
-  }
-
-  const conflictingIntervals = normalized.filter((interval) => (
-    interval.startMs < candidateEndMs && interval.endMs > candidateStartMs
-  ));
-
-  return { hasConflict: true, conflictingIntervals };
+function buildExactTimeConflicts(intervals) {
+  return {
+    hasConflict: intervals.length > 0,
+    conflictingIntervals: intervals,
+  };
 }
 
 async function getProjectMemberGroups(projectId, fallbackUserId, queryRunner = db) {
@@ -148,7 +95,7 @@ function buildInClausePlaceholders(items) {
   return items.map(() => '?').join(', ');
 }
 
-async function getParticipantSchedules(userIds, candidateStart, candidateEnd, queryRunner = db) {
+async function getParticipantSchedules(userIds, scheduledAt, queryRunner = db) {
   if (!userIds.length) {
     return [];
   }
@@ -156,149 +103,189 @@ async function getParticipantSchedules(userIds, candidateStart, candidateEnd, qu
   const placeholders = buildInClausePlaceholders(userIds);
   const rows = await queryRows(
     queryRunner,
-    `SELECT DISTINCT d.id, d.project_id, d.start_time, d.end_time, d.location, pm.user_id AS participant_id
+    `SELECT DISTINCT d.id, d.project_id, d.scheduled_at, d.location, pm.user_id AS participant_id
      FROM defenses d
      JOIN project_members pm
        ON pm.project_id = d.project_id
       AND pm.status = 'accepted'
      WHERE pm.user_id IN (${placeholders})
        AND d.status = 'scheduled'
-       AND d.start_time < ?
-       AND d.end_time > ?`,
-    [...userIds, candidateEnd, candidateStart]
+       AND d.scheduled_at = ?`,
+    [...userIds, scheduledAt]
   );
 
   return rows;
 }
 
-async function getRoomSchedules(location, candidateStart, candidateEnd, queryRunner = db) {
+async function getRoomSchedules(location, scheduledAt, queryRunner = db) {
   if (!location || location.toLowerCase() === 'online') {
     return [];
   }
 
   const rows = await queryRows(
     queryRunner,
-    `SELECT id, project_id, start_time, end_time, location
+    `SELECT id, project_id, scheduled_at, location
      FROM defenses
      WHERE status = 'scheduled'
        AND location = ?
-       AND start_time < ?
-       AND end_time > ?`,
-    [location, candidateEnd, candidateStart]
+       AND scheduled_at = ?`,
+    [location, scheduledAt]
   );
 
   return rows;
 }
 
-async function getProjectSchedules(projectId, candidateStart, candidateEnd, queryRunner = db) {
+async function getProjectSchedules(projectId, scheduledAt, queryRunner = db) {
   const rows = await queryRows(
     queryRunner,
-    `SELECT id, project_id, start_time, end_time, location
+    `SELECT id, project_id, scheduled_at, location
      FROM defenses
      WHERE project_id = ?
        AND status = 'scheduled'
-       AND start_time < ?
-       AND end_time > ?`,
-    [projectId, candidateEnd, candidateStart]
+       AND scheduled_at = ?`,
+    [projectId, scheduledAt]
   );
   return rows;
 }
 
-async function validateScheduleConstraints({ projectId, startTime, endTime, startDate, endDate, location, fallbackTeacherId, queryRunner = db }) {
+async function validateScheduleConstraints({ projectId, scheduledAt, location, fallbackTeacherId, queryRunner = db }) {
   const [projectSchedules, roomSchedules, memberGroups] = await Promise.all([
-    getProjectSchedules(projectId, startTime, endTime, queryRunner),
-    getRoomSchedules(location, startTime, endTime, queryRunner),
+    getProjectSchedules(projectId, scheduledAt, queryRunner),
+    getRoomSchedules(location, scheduledAt, queryRunner),
     getProjectMemberGroups(projectId, fallbackTeacherId, queryRunner),
   ]);
 
   const [teacherSchedules, studentSchedules] = await Promise.all([
-    getParticipantSchedules(memberGroups.teacherIds, startTime, endTime, queryRunner),
-    getParticipantSchedules(memberGroups.studentIds, startTime, endTime, queryRunner),
+    getParticipantSchedules(memberGroups.teacherIds, scheduledAt, queryRunner),
+    getParticipantSchedules(memberGroups.studentIds, scheduledAt, queryRunner),
   ]);
 
-  // Dynamic Programming checks are applied per constraint domain.
-  const overlapResult = buildOccupancyDp(projectSchedules, startDate, endDate);
-  if (overlapResult.hasConflict) {
-    return {
-      error: 'Overlapping schedules: this project already has a meeting in the selected time range',
-      status: 409,
-    };
+  const allConflicts = [];
+
+  const checks = [
+    { label: 'project', result: buildExactTimeConflicts(projectSchedules) },
+    { label: 'room', result: buildExactTimeConflicts(roomSchedules) },
+    { label: 'teacher', result: buildExactTimeConflicts(teacherSchedules) },
+    { label: 'student', result: buildExactTimeConflicts(studentSchedules) },
+  ];
+
+  for (const { label, result } of checks) {
+    if (result.hasConflict) {
+      for (const interval of result.conflictingIntervals) {
+        allConflicts.push({
+          domain: label,
+          defense_id: interval.id,
+          project_id: interval.project_id,
+          scheduled_at: interval.scheduled_at,
+        });
+      }
+    }
   }
 
-  const roomResult = buildOccupancyDp(roomSchedules, startDate, endDate);
-  if (roomResult.hasConflict) {
-    return {
-      error: 'Room availability conflict: selected room is not available in the selected time range',
-      status: 409,
-    };
+  if (!allConflicts.length) {
+    return { ok: true, conflicts: [] };
   }
 
-  const teacherResult = buildOccupancyDp(teacherSchedules, startDate, endDate);
-  if (teacherResult.hasConflict) {
-    return {
-      error: 'Teacher availability conflict: one or more teachers already have a meeting in the selected time range',
-      status: 409,
-    };
-  }
-
-  const studentResult = buildOccupancyDp(studentSchedules, startDate, endDate);
-  if (studentResult.hasConflict) {
-    return {
-      error: 'Student availability conflict: one or more students already have a meeting in the selected time range',
-      status: 409,
-    };
-  }
-
-  return { ok: true };
+  return { ok: false, conflicts: allConflicts };
 }
- 
+
 async function createDefense(userId, payload) {
   let conn;
   try {
-    const { project_id, section, defense_type, start_time, end_time, location, partial_time } = payload;
- 
+    const { project_id, defense_type, scheduled_at, location, modality, force_pending, submit_as_proposal } = payload;
+    const scheduleInput = scheduled_at;
+
     if (!project_id) return { error: 'project_id is required' };
     if (!defense_type || !['proposal', 'midterm', 'final'].includes(defense_type)) {
       return { error: 'defense_type must be one of: proposal, midterm, final' };
     }
-    if (!start_time) return { error: 'start_time is required' };
-    if (!end_time) return { error: 'end_time is required' };
+    if (!scheduleInput) return { error: 'scheduled_at is required' };
     if (!location) return { error: 'location is required' };
 
-    const normalizedStart = normalizeDateTimeInput(start_time);
-    const normalizedEnd = normalizeDateTimeInput(end_time);
-    if (!normalizedStart) return { error: 'start_time must be a valid datetime value' };
-    if (!normalizedEnd) return { error: 'end_time must be a valid datetime value' };
-    if (normalizedStart.dateValue.getTime() >= normalizedEnd.dateValue.getTime()) {
-      return { error: 'end_time must be after start_time' };
-    }
+    const normalizedSchedule = normalizeDateTimeInput(scheduleInput);
+    if (!normalizedSchedule) return { error: 'scheduled_at must be a valid datetime value' };
 
     conn = await db.pool.getConnection();
     await conn.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
     await conn.beginTransaction();
 
+    const [projectRows] = await conn.execute(
+      'SELECT id, institution_id FROM projects WHERE id = ? LIMIT 1',
+      [project_id]
+    );
+
+    const project = projectRows[0];
+    if (!project) {
+      await conn.rollback();
+      return { error: 'Project not found', status: 404 };
+    }
+
+    const [institutionRows] = await conn.execute(
+      `SELECT institution_id
+       FROM user_roles
+       WHERE user_id = ?
+         AND role = 'adviser'
+         AND institution_id IS NOT NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId]
+    );
+
+    const adviserInstitutionId = institutionRows[0]?.institution_id || null;
+    if (!adviserInstitutionId) {
+      await conn.rollback();
+      return {
+        error: 'Adviser must be assigned to an institution before submitting a defense proposal.',
+        status: 400,
+      };
+    }
+
+    if (!project.institution_id) {
+      await conn.execute(
+        'UPDATE projects SET institution_id = ? WHERE id = ?',
+        [adviserInstitutionId, project_id]
+      );
+    } else if (project.institution_id !== adviserInstitutionId) {
+      await conn.rollback();
+      return {
+        error: 'Project institution does not match adviser institution.',
+        status: 403,
+      };
+    }
+
     const scheduleCheck = await validateScheduleConstraints({
       projectId: project_id,
-      startTime: normalizedStart.dbValue,
-      endTime: normalizedEnd.dbValue,
-      startDate: normalizedStart.dateValue,
-      endDate: normalizedEnd.dateValue,
+      scheduledAt: normalizedSchedule.dbValue,
       location,
       fallbackTeacherId: userId,
       queryRunner: conn,
     });
-    if (scheduleCheck.error) {
-      await conn.rollback();
-      return scheduleCheck;
+
+    let status = submit_as_proposal ? 'pending' : 'scheduled';
+    let blockedBy = null;
+    if (!scheduleCheck.ok) {
+      const conflicts = scheduleCheck.conflicts;
+      if (force_pending || submit_as_proposal) {
+        status = 'pending';
+        blockedBy = conflicts[0].defense_id;
+      } else {
+        await conn.rollback();
+        return {
+          conflict: true,
+          conflicts,
+          message: 'Schedule conflict detected for this datetime. Please choose another time or set force_pending.',
+          status: 409,
+        };
+      }
     }
 
     const [idRows] = await conn.execute('SELECT UUID() AS id');
     const defenseId = idRows[0].id;
- 
+
     await conn.execute(
-      `INSERT INTO defenses (id, project_id, section, defense_type, start_time, end_time, location, partial_time, status, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?)`,
-      [defenseId, project_id, section, defense_type, normalizedStart.dbValue, normalizedEnd.dbValue, location, partial_time ? 1 : 0, userId]
+      `INSERT INTO defenses (id, project_id, defense_type, scheduled_at, location, modality, status, blocked_by, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [defenseId, project_id, defense_type, normalizedSchedule.dbValue, location, modality || 'Online', status, blockedBy, userId]
     );
 
     const [rows] = await conn.execute(
@@ -307,7 +294,12 @@ async function createDefense(userId, payload) {
     );
 
     await conn.commit();
- 
+
+    // Adviser proposals should stay pending for coordinator review.
+    if (!submit_as_proposal) {
+      await processAllPendingDefenses();
+    }
+
     return { data: rows[0] };
   } catch (err) {
     if (conn) {
@@ -323,19 +315,36 @@ async function createDefense(userId, payload) {
     if (conn) conn.release();
   }
 }
- 
+
 async function getDefensesByUser(userId) {
   const { rows } = await db.query(
     `SELECT d.*, p.title AS project_title, p.project_code,
             CASE
+              WHEN d.status = 'scheduled' THEN 'Scheduled'
+              WHEN d.status = 'pending' THEN 'Pending'
               WHEN d.status = 'cancelled' THEN 'Cancelled'
-              WHEN d.status = 'completed' THEN 'Approved'
-              ELSE 'Pending'
+              WHEN d.status = 'rescheduled' THEN 'Rescheduled'
+              WHEN d.status = 'completed' THEN 'Completed'
+              ELSE d.status
             END AS status_label
      FROM defenses d
      LEFT JOIN projects p ON d.project_id = p.id
      WHERE d.created_by = ?
-     ORDER BY d.start_time DESC`,
+     ORDER BY d.scheduled_at DESC`,
+    [userId]
+  );
+  return rows;
+}
+
+async function getDefensesForMember(userId) {
+  const { rows } = await db.query(
+    `SELECT d.*, p.title AS project_title, p.project_code,
+            u.full_name AS created_by_name
+     FROM defenses d
+     JOIN projects p ON d.project_id = p.id
+     JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = ?
+     LEFT JOIN users u ON d.created_by = u.id
+     ORDER BY d.scheduled_at DESC`,
     [userId]
   );
   return rows;
@@ -365,18 +374,22 @@ async function cancelDefense(userId, defenseId) {
   }
 
   await db.query(
-    `UPDATE defenses
-     SET status = 'cancelled'
-     WHERE id = ?`,
+    `UPDATE defenses SET status = 'cancelled' WHERE id = ?`,
     [defenseId]
   );
+
+  await promotePendingDefenses(defenseId);
+  await processAllPendingDefenses();
 
   const { rows: updatedRows } = await db.query(
     `SELECT d.*, p.title AS project_title, p.project_code,
             CASE
+              WHEN d.status = 'scheduled' THEN 'Scheduled'
+              WHEN d.status = 'pending' THEN 'Pending'
               WHEN d.status = 'cancelled' THEN 'Cancelled'
-              WHEN d.status = 'completed' THEN 'Approved'
-              ELSE 'Pending'
+              WHEN d.status = 'rescheduled' THEN 'Rescheduled'
+              WHEN d.status = 'completed' THEN 'Completed'
+              ELSE d.status
             END AS status_label
      FROM defenses d
      LEFT JOIN projects p ON d.project_id = p.id
@@ -387,5 +400,164 @@ async function cancelDefense(userId, defenseId) {
 
   return { data: updatedRows[0] || null };
 }
- 
-module.exports = { createDefense, getDefensesByUser, cancelDefense };
+
+async function promotePendingDefenses(cancelledDefenseId) {
+  const { rows: pendingRows } = await db.query(
+    `SELECT * FROM defenses WHERE blocked_by = ? AND status = 'pending'`,
+    [cancelledDefenseId]
+  );
+
+  for (const pending of pendingRows) {
+    const normalizedSchedule = normalizeDateTimeInput(pending.scheduled_at);
+    if (!normalizedSchedule) continue;
+
+    const recheck = await validateScheduleConstraints({
+      projectId: pending.project_id,
+      scheduledAt: normalizedSchedule.dbValue,
+      location: pending.location,
+      fallbackTeacherId: pending.created_by,
+    });
+
+    if (recheck.ok) {
+      await db.query(
+        `UPDATE defenses SET status = 'scheduled', blocked_by = NULL WHERE id = ?`,
+        [pending.id]
+      );
+    }
+  }
+}
+
+async function processAllPendingDefenses() {
+  let conn;
+  try {
+    conn = await db.pool.getConnection();
+    await conn.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+    await conn.beginTransaction();
+
+    const [pendingRows] = await conn.execute(
+      `SELECT * FROM defenses WHERE status = 'pending' ORDER BY created_at ASC`
+    );
+
+    for (const pending of pendingRows) {
+      const normalizedSchedule = normalizeDateTimeInput(pending.scheduled_at);
+      if (!normalizedSchedule) continue;
+
+      const recheck = await validateScheduleConstraints({
+        projectId: pending.project_id,
+        scheduledAt: normalizedSchedule.dbValue,
+        location: pending.location,
+        fallbackTeacherId: pending.created_by,
+        queryRunner: conn,
+      });
+
+      if (recheck.ok) {
+        await conn.execute(
+          `UPDATE defenses SET status = 'scheduled', blocked_by = NULL WHERE id = ?`,
+          [pending.id]
+        );
+      }
+    }
+
+    await conn.commit();
+  } catch (err) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (e) {
+        console.error('processAllPending rollback error:', e);
+      }
+    }
+    console.error('processAllPendingDefenses error:', err);
+  } finally {
+    if (conn) conn.release();
+  }
+}
+
+async function rescheduleDefense(userId, defenseId, payload) {
+  if (!defenseId) {
+    return { error: 'defenseId is required', status: 400 };
+  }
+
+  const { rows } = await db.query(
+    'SELECT * FROM defenses WHERE id = ? LIMIT 1',
+    [defenseId]
+  );
+
+  if (!rows.length) {
+    return { error: 'Meeting not found', status: 404 };
+  }
+
+  const defense = rows[0];
+  if (defense.created_by !== userId) {
+    return { error: 'You are not allowed to reschedule this meeting', status: 403 };
+  }
+
+  if (defense.status === 'cancelled') {
+    return { error: 'Cannot reschedule a cancelled meeting', status: 409 };
+  }
+
+  const scheduleInput = payload.scheduled_at;
+  if (!scheduleInput) return { error: 'scheduled_at is required' };
+
+  const normalizedSchedule = normalizeDateTimeInput(scheduleInput);
+  if (!normalizedSchedule) return { error: 'scheduled_at must be a valid datetime value' };
+
+  let conn;
+  try {
+    conn = await db.pool.getConnection();
+    await conn.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+    await conn.beginTransaction();
+
+    await conn.execute(
+      `UPDATE defenses SET status = 'cancelled' WHERE id = ?`,
+      [defenseId]
+    );
+
+    const scheduleCheck = await validateScheduleConstraints({
+      projectId: defense.project_id,
+      scheduledAt: normalizedSchedule.dbValue,
+      location: defense.location,
+      fallbackTeacherId: userId,
+      queryRunner: conn,
+    });
+
+    if (!scheduleCheck.ok) {
+      await conn.rollback();
+      return {
+        conflict: true,
+        conflicts: scheduleCheck.conflicts,
+        message: 'Rescheduled datetime has conflicts.',
+        status: 409,
+      };
+    }
+
+    await conn.execute(
+      `UPDATE defenses SET scheduled_at = ?, status = 'rescheduled', blocked_by = NULL WHERE id = ?`,
+      [normalizedSchedule.dbValue, defenseId]
+    );
+
+    const [updatedRows] = await conn.execute(
+      'SELECT * FROM defenses WHERE id = ? LIMIT 1',
+      [defenseId]
+    );
+
+    await conn.commit();
+    await processAllPendingDefenses();
+
+    return { data: updatedRows[0] };
+  } catch (err) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (e) {
+        console.error('reschedule rollback error:', e);
+      }
+    }
+    console.error('rescheduleDefense error:', err);
+    throw err;
+  } finally {
+    if (conn) conn.release();
+  }
+}
+
+module.exports = { createDefense, getDefensesByUser, getDefensesForMember, cancelDefense, rescheduleDefense };

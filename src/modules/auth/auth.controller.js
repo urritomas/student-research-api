@@ -195,7 +195,7 @@ async function googleCallback(req, res) {
     const token = authService.generateToken(user);
 
     res.cookie('session_token', token, getCookieOptions());
-    return res.redirect(`${webOrigin}/auth/continue`);
+    return res.redirect(`${webOrigin}/auth/continue?token=${encodeURIComponent(token)}`);
   } catch (err) {
     console.error(err);
     return res.redirect(`${webOrigin}/login?error=oauth_failed`);

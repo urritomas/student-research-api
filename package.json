@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node scripts/run-migrations.js && node src/server.js",
     "dev": "nodemon src/server.js",
     "docker:up": "docker compose up -d --build",
     "docker:down": "docker compose down",
@@ -23,6 +23,9 @@
   "license": "ISC",
   "type": "commonjs",
   "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "bugs": {
     "url": "https://github.com/urritomas/student-research-api/issues"
   },

@@ -284,6 +284,24 @@ async function scheduleDefense(req, res) {
   }
 }
 
+async function updateStatus(req, res) {
+  try {
+    const { status } = req.body;
+    if (!status) {
+      return res.status(400).json({ error: 'status is required' });
+    }
+
+    const result = await projectsService.updateProjectStatus(req.params.id, status, req.user.id);
+    if (result.error) {
+      return res.status(400).json({ error: result.error });
+    }
+    return res.json(result.data);
+  } catch (err) {
+    console.error('projects.controller – updateStatus error:', err);
+    return res.status(500).json({ error: 'Failed to update project status' });
+  }
+}
+
 module.exports = {
   create,
   list,
@@ -297,4 +315,5 @@ module.exports = {
   respondInvitation,
   getInvitations,
   scheduleDefense,
+  updateStatus,
 };

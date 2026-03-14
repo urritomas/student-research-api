@@ -199,7 +199,12 @@ async function findOrCreateGoogleUser(profile) {
 
 async function getUserById(userId) {
   const { rows } = await db.query(
-    'SELECT id, email, full_name, avatar_url, auth_provider, status FROM users WHERE id = ? LIMIT 1',
+    `SELECT u.id, u.email, u.full_name, u.avatar_url, u.auth_provider, u.status, ur.role
+     FROM users u
+     LEFT JOIN user_roles ur ON ur.user_id = u.id
+     WHERE u.id = ?
+     ORDER BY ur.created_at DESC
+     LIMIT 1`,
     [userId]
   );
   return rows[0] || null;

@@ -45,6 +45,37 @@ function normalizeDateTimeInput(value) {
   };
 }
 
+function getScheduleWindow(payload = {}) {
+  const startInput = payload.start_time ?? payload.scheduled_at ?? payload.scheduledAt ?? null;
+  const endInput = payload.end_time ?? payload.endTime ?? null;
+
+  if (!startInput) {
+    return { error: 'start_time is required' };
+  }
+  if (!endInput) {
+    return { error: 'end_time is required' };
+  }
+
+  const normalizedStart = normalizeDateTimeInput(startInput);
+  if (!normalizedStart) {
+    return { error: 'start_time must be a valid datetime value' };
+  }
+
+  const normalizedEnd = normalizeDateTimeInput(endInput);
+  if (!normalizedEnd) {
+    return { error: 'end_time must be a valid datetime value' };
+  }
+
+  if (normalizedEnd.dateValue <= normalizedStart.dateValue) {
+    return { error: 'end_time must be after start_time' };
+  }
+
+  return {
+    start: normalizedStart,
+    end: normalizedEnd,
+  };
+}
+
 async function queryRows(queryRunner, sql, params) {
   if (queryRunner && typeof queryRunner.execute === 'function') {
     const [rows] = await queryRunner.execute(sql, params);
@@ -192,18 +223,17 @@ async function validateScheduleConstraints({ projectId, scheduledAt, location, f
 async function createDefense(userId, payload) {
   let conn;
   try {
-    const { project_id, defense_type, scheduled_at, location, modality, force_pending, submit_as_proposal } = payload;
-    const scheduleInput = scheduled_at;
+    const { project_id, defense_type, location, modality, force_pending, submit_as_proposal } = payload;
+    const scheduleWindow = getScheduleWindow(payload);
 
     if (!project_id) return { error: 'project_id is required' };
     if (!defense_type || !['proposal', 'midterm', 'final'].includes(defense_type)) {
       return { error: 'defense_type must be one of: proposal, midterm, final' };
     }
-    if (!scheduleInput) return { error: 'scheduled_at is required' };
+    if (scheduleWindow.error) return { error: scheduleWindow.error };
     if (!location) return { error: 'location is required' };
 
-    const normalizedSchedule = normalizeDateTimeInput(scheduleInput);
-    if (!normalizedSchedule) return { error: 'scheduled_at must be a valid datetime value' };
+    const normalizedSchedule = scheduleWindow.start;
 
     conn = await db.pool.getConnection();
     await conn.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
@@ -496,11 +526,10 @@ async function rescheduleDefense(userId, defenseId, payload) {
     return { error: 'Cannot reschedule a cancelled meeting', status: 409 };
   }
 
-  const scheduleInput = payload.scheduled_at;
-  if (!scheduleInput) return { error: 'scheduled_at is required' };
+  const scheduleWindow = getScheduleWindow(payload);
+  if (scheduleWindow.error) return { error: scheduleWindow.error };
 
-  const normalizedSchedule = normalizeDateTimeInput(scheduleInput);
-  if (!normalizedSchedule) return { error: 'scheduled_at must be a valid datetime value' };
+  const normalizedSchedule = scheduleWindow.start;
 
   let conn;
   try {

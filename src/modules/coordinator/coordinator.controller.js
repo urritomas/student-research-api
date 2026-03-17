@@ -112,11 +112,11 @@ async function listAllDefenses(req, res) {
 }
 
 async function verifyDefense(req, res) {
-  const { venue, verifiedSchedule, notes } = req.body;
+  const { venue, verifiedSchedule, verifiedEndTime, notes, forceApprove } = req.body;
   const result = await coordinatorService.verifyDefense(
     req.params.defenseId,
     req.user.id,
-    { venue, verifiedSchedule, notes }
+    { venue, verifiedSchedule, verifiedEndTime, notes, forceApprove }
   );
 
   if (result.error) {

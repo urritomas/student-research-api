@@ -13,14 +13,20 @@ async function postDefense(req, res) {
 }
 
 async function postDefenseProposal(req, res) {
+  const body = req.body || {};
   const result = await createDefense(req.user.id, {
-    ...(req.body || {}),
+    ...body,
     submit_as_proposal: true,
-    force_pending: true,
+    force_pending: Boolean(body.force_proceed),
+    force_proceed: Boolean(body.force_proceed),
   });
 
   if (result.error) {
     return res.status(result.status || 400).json({ error: result.error });
+  }
+
+  if (result.conflict) {
+    return res.status(409).json(result);
   }
 
   return res.status(201).json(result.data);

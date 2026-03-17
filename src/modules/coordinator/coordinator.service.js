@@ -30,6 +30,153 @@ async function getDefenseScheduleExpr() {
   return defenseScheduleExprCache;
 }
 
+function normalizeDefenseTimeRange(row) {
+  const start = row.start_time || row.scheduled_at || null;
+  const end = row.end_time || start;
+
+  return {
+    ...row,
+    start_time: start,
+    end_time: end,
+  };
+}
+
+function toDate(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+  if (value == null) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function computeOverlapMinutes(rangeStart, rangeEnd, candidateStart, candidateEnd) {
+  const overlapStart = Math.max(rangeStart.getTime(), candidateStart.getTime());
+  const overlapEnd = Math.min(rangeEnd.getTime(), candidateEnd.getTime());
+  if (overlapEnd <= overlapStart) return 0;
+  return Math.round((overlapEnd - overlapStart) / 60000);
+}
+
+function buildCoordinatorConflictPayload(conflicts, startDate, endDate) {
+  const candidateTotalMinutes = Math.max(0, Math.round((endDate.getTime() - startDate.getTime()) / 60000));
+
+  const normalizedConflicts = conflicts.map((conflict) => {
+    const overlapMinutes = computeOverlapMinutes(conflict.start_date, conflict.end_date, startDate, endDate);
+    return {
+      domain: conflict.domain,
+      defense_id: conflict.defense_id,
+      project_id: conflict.project_id,
+      start_time: conflict.start_time,
+      end_time: conflict.end_time,
+      overlap_minutes: overlapMinutes,
+      remaining_minutes: Math.max(0, candidateTotalMinutes - overlapMinutes),
+    };
+  });
+
+  const maxOverlapMinutes = normalizedConflicts.reduce(
+    (max, conflict) => Math.max(max, conflict.overlap_minutes || 0),
+    0
+  );
+
+  return {
+    conflict: true,
+    conflicts: normalizedConflicts,
+    max_overlap_minutes: maxOverlapMinutes,
+    candidate_total_minutes: candidateTotalMinutes,
+    effective_minutes: Math.max(0, candidateTotalMinutes - maxOverlapMinutes),
+    message: 'Schedule overlap detected with approved or booked defenses.',
+  };
+}
+
+async function getCoordinatorApprovalConflicts({ defenseId, projectId, memberIds, location, startAt, endAt, queryRunner }) {
+  const statuses = ['approved', 'moved', 'scheduled'];
+  const allConflicts = [];
+
+  const [projectRows] = await queryRunner.execute(
+    `SELECT id, project_id,
+            scheduled_at AS start_time,
+            COALESCE(end_time, scheduled_at) AS end_time
+     FROM defenses
+     WHERE id <> ?
+       AND project_id = ?
+       AND status IN (?, ?, ?)
+       AND scheduled_at < ?
+       AND COALESCE(end_time, scheduled_at) > ?`,
+    [defenseId, projectId, ...statuses, endAt, startAt]
+  );
+
+  for (const row of projectRows) {
+    allConflicts.push({
+      domain: 'project',
+      defense_id: row.id,
+      project_id: row.project_id,
+      start_time: row.start_time,
+      end_time: row.end_time,
+      start_date: toDate(row.start_time),
+      end_date: toDate(row.end_time || row.start_time),
+    });
+  }
+
+  if (location && String(location).toLowerCase() !== 'online') {
+    const [locationRows] = await queryRunner.execute(
+      `SELECT id, project_id,
+              scheduled_at AS start_time,
+              COALESCE(end_time, scheduled_at) AS end_time
+       FROM defenses
+       WHERE id <> ?
+         AND status IN (?, ?, ?)
+         AND COALESCE(venue, location) = ?
+         AND scheduled_at < ?
+         AND COALESCE(end_time, scheduled_at) > ?`,
+      [defenseId, ...statuses, location, endAt, startAt]
+    );
+
+    for (const row of locationRows) {
+      allConflicts.push({
+        domain: 'room',
+        defense_id: row.id,
+        project_id: row.project_id,
+        start_time: row.start_time,
+        end_time: row.end_time,
+        start_date: toDate(row.start_time),
+        end_date: toDate(row.end_time || row.start_time),
+      });
+    }
+  }
+
+  if (memberIds.length) {
+    const memberPlaceholders = memberIds.map(() => '?').join(', ');
+    const [participantRows] = await queryRunner.execute(
+      `SELECT DISTINCT d.id, d.project_id,
+              scheduled_at AS start_time,
+              COALESCE(d.end_time, d.scheduled_at) AS end_time
+       FROM defenses d
+       JOIN project_members pm
+         ON pm.project_id = d.project_id
+        AND pm.status = 'accepted'
+       WHERE d.id <> ?
+         AND pm.user_id IN (${memberPlaceholders})
+         AND d.status IN (?, ?, ?)
+         AND d.scheduled_at < ?
+         AND COALESCE(d.end_time, d.scheduled_at) > ?`,
+      [defenseId, ...memberIds, ...statuses, endAt, startAt]
+    );
+
+    for (const row of participantRows) {
+      allConflicts.push({
+        domain: 'participant',
+        defense_id: row.id,
+        project_id: row.project_id,
+        start_time: row.start_time,
+        end_time: row.end_time,
+        start_date: toDate(row.start_time),
+        end_date: toDate(row.end_time || row.start_time),
+      });
+    }
+  }
+
+  const deduped = Array.from(new Map(allConflicts.map((item) => [item.defense_id, item])).values());
+  return deduped;
+}
+
 // ─── Institution Management ─────────────────────────────────────────────────
 
 async function getInstitutionByCoordinator(userId) {
@@ -187,6 +334,8 @@ async function getPendingDefenses(institutionId) {
   const { rows } = await db.query(
     `SELECT d.*, p.title AS project_title, p.project_code,
             ${scheduleExpr} AS scheduled_at,
+            ${scheduleExpr} AS start_time,
+            COALESCE(d.end_time, ${scheduleExpr}) AS end_time,
             u.full_name AS created_by_name
      FROM defenses d
      INNER JOIN projects p ON d.project_id = p.id
@@ -197,7 +346,7 @@ async function getPendingDefenses(institutionId) {
      ORDER BY ${scheduleExpr} ASC`,
     [institutionId]
   );
-  return rows;
+  return rows.map(normalizeDefenseTimeRange);
 }
 
 async function getAllDefensesForInstitution(institutionId) {
@@ -206,6 +355,8 @@ async function getAllDefensesForInstitution(institutionId) {
   const { rows } = await db.query(
     `SELECT d.*, p.title AS project_title, p.project_code,
             ${scheduleExpr} AS scheduled_at,
+            ${scheduleExpr} AS start_time,
+            COALESCE(d.end_time, ${scheduleExpr}) AS end_time,
             u.full_name AS created_by_name,
             vu.full_name AS verified_by_name
      FROM defenses d
@@ -216,10 +367,10 @@ async function getAllDefensesForInstitution(institutionId) {
      ORDER BY ${scheduleExpr} DESC`,
     [institutionId]
   );
-  return rows;
+  return rows.map(normalizeDefenseTimeRange);
 }
 
-async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule, notes }) {
+async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule, verifiedEndTime, notes, forceApprove }) {
   const conn = await db.pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -238,6 +389,42 @@ async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule
       return { error: 'Defense not found' };
     }
 
+    const proposedStart = verifiedSchedule || defense.scheduled_at;
+    const proposedEnd = verifiedEndTime || defense.end_time || proposedStart;
+
+    const proposedStartDate = toDate(proposedStart);
+    const proposedEndDate = toDate(proposedEnd);
+    if (!proposedStartDate || !proposedEndDate || proposedEndDate <= proposedStartDate) {
+      await conn.rollback();
+      return { error: 'Invalid schedule range' };
+    }
+
+    const [memberRows] = await conn.execute(
+      `SELECT user_id
+       FROM project_members
+       WHERE project_id = ?
+         AND status = 'accepted'`,
+      [defense.project_id]
+    );
+
+    const targetLocation = venue || defense.venue || defense.location || null;
+    const conflicts = await getCoordinatorApprovalConflicts({
+      defenseId,
+      projectId: defense.project_id,
+      memberIds: memberRows.map((member) => member.user_id),
+      location: targetLocation,
+      startAt: proposedStart,
+      endAt: proposedEnd,
+      queryRunner: conn,
+    });
+
+    if (conflicts.length && !forceApprove) {
+      await conn.rollback();
+      return {
+        data: buildCoordinatorConflictPayload(conflicts, proposedStartDate, proposedEndDate),
+      };
+    }
+
     // Determine status: 'moved' if schedule was changed, otherwise 'approved'
     const scheduleMoved = verifiedSchedule && verifiedSchedule !== defense.scheduled_at?.toISOString?.();
     const newStatus = scheduleMoved ? 'moved' : 'approved';
@@ -248,10 +435,12 @@ async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule
       `UPDATE defenses
        SET verified_by = ?, verified_at = NOW(),
            venue = COALESCE(?, venue),
+           scheduled_at = ?,
+           end_time = ?,
            verified_schedule = ?,
            status = ?
        WHERE id = ?`,
-      [coordinatorId, venue || null, verifiedSchedule || defense.scheduled_at, newStatus, defenseId]
+      [coordinatorId, venue || null, proposedStart, proposedEnd, proposedStart, newStatus, defenseId]
     );
 
     // Create verification audit record
@@ -262,7 +451,7 @@ async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule
         defenseId,
         coordinatorId,
         defense.scheduled_at,
-        verifiedSchedule || defense.scheduled_at,
+        proposedStart,
         defense.venue || defense.location,
         venue || defense.venue || defense.location,
         notes || null,
@@ -270,12 +459,9 @@ async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule
     );
 
     // Notify all project members
-    const [members] = await conn.execute(
-      'SELECT user_id FROM project_members WHERE project_id = ?',
-      [defense.project_id]
-    );
+    const members = memberRows;
 
-    const finalSchedule = verifiedSchedule || defense.scheduled_at;
+    const finalSchedule = proposedStart;
     const dateStr = new Date(finalSchedule).toLocaleDateString();
     const timeStr = new Date(finalSchedule).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const modality = defense.modality || 'Online';

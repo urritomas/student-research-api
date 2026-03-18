@@ -6,8 +6,9 @@ const Diff = require('diff');
 const paperVersionsService = require('./paper_versions.service');
 const { generateDocxTemplate } = require('./template.generator');
 const { getProjectById } = require('../projects/projects.service');
+const { uploadBase } = require('../../../config/env');
 
-const FILES_DIR = path.join(__dirname, '..', '..', '..', 'uploads', 'files');
+const FILES_DIR = path.join(uploadBase, 'files');
 
 function ensureFilesDir() {
   if (!fs.existsSync(FILES_DIR)) {
@@ -121,8 +122,16 @@ async function download(req, res) {
   }
 
   // file_url is stored as /uploads/files/<filename>
-  const relativePath = version.file_url.replace(/^\//, '');
-  const absolutePath = path.join(__dirname, '..', '..', '..', relativePath);
+  // Extract the filename from the URL
+  const filename = path.basename(version.file_url);
+  const absolutePath = path.join(FILES_DIR, filename);
+
+  // Verify the file is within FILES_DIR to prevent path traversal
+  const normalizedPath = path.normalize(absolutePath);
+  const normalizedDir = path.normalize(FILES_DIR);
+  if (!normalizedPath.startsWith(normalizedDir)) {
+    return res.status(403).json({ error: 'Invalid file path' });
+  }
 
   if (!fs.existsSync(absolutePath)) {
     return res.status(404).json({ error: 'File not found on disk' });
@@ -134,8 +143,19 @@ async function download(req, res) {
 }
 
 function resolveFilePath(fileUrl) {
-  const rel = fileUrl.replace(/^\//, '');
-  return path.join(__dirname, '..', '..', '..', rel);
+  // file_url is stored as /uploads/files/<filename>
+  // Extract the filename from the URL
+  const filename = path.basename(fileUrl);
+  const absolutePath = path.join(FILES_DIR, filename);
+
+  // Verify the file is within FILES_DIR to prevent path traversal
+  const normalizedPath = path.normalize(absolutePath);
+  const normalizedDir = path.normalize(FILES_DIR);
+  if (!normalizedPath.startsWith(normalizedDir)) {
+    throw new Error('Invalid file path');
+  }
+
+  return absolutePath;
 }
 
 async function extractText(filePath) {

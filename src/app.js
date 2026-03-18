@@ -18,6 +18,7 @@ const notificationsRouter = require('./modules/notifications/notifications.route
 const paperVersionsRouter = require('./modules/paper_versions/paper_versions.routes');
 const defensesRouter = require('./modules/defenses/defenses.routes');
 const coordinatorRouter = require('./modules/coordinator/coordinator.routes');
+const fileOperationsRouter = require('./modules/file_operations/file_operations.routes');
 const app = express();
 
 app.disable('x-powered-by');
@@ -89,6 +90,8 @@ app.use('/api/notifications', notificationsRouter);
 app.use('/api/projects/:id/paper-versions', paperVersionsRouter);
 app.use('/api/defenses', defensesRouter);
 app.use('/api/coordinator', coordinatorRouter);
+app.use('/api', fileOperationsRouter);
+app.use('/api/file-operations', fileOperationsRouter);
 
 app.use((err, req, res, next) => {
   if (err.message === 'Not allowed by CORS') {

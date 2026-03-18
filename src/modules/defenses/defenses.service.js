@@ -384,8 +384,8 @@ function resolveBookingScheduleSources(payload = {}) {
     return normalizeScheduleSources(explicitSources);
   }
 
-  // Adviser legacy flow still relies on meetings data.
-  if (payload.submit_as_proposal || payload.booking_side === 'adviser' || payload.use_legacy_meetings) {
+  // Adviser flow checks both meetings and defenses to avoid cross-table overlaps.
+  if (payload.booking_side === 'adviser' || payload.use_legacy_meetings) {
     return ['meetings', 'defenses'];
   }
 
@@ -468,7 +468,7 @@ async function validateScheduleConstraints({
 async function createDefense(userId, payload) {
   let conn;
   try {
-    const { project_id, defense_type, location, modality, force_pending, force_proceed, submit_as_proposal } = payload;
+    const { project_id, defense_type, location, modality, wait_for_slot } = payload;
     const scheduleWindow = getScheduleWindow(payload);
 
     if (!project_id) return { error: 'project_id is required' };
@@ -497,61 +497,27 @@ async function createDefense(userId, payload) {
       return { error: 'Project not found', status: 404 };
     }
 
-    const [institutionRows] = await conn.execute(
-      `SELECT institution_id
-       FROM user_roles
-       WHERE user_id = ?
-         AND role = 'adviser'
-         AND institution_id IS NOT NULL
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [userId]
-    );
-
-    const adviserInstitutionId = institutionRows[0]?.institution_id || null;
-    if (!adviserInstitutionId) {
-      await conn.rollback();
-      return {
-        error: 'Adviser must be assigned to an institution before submitting a defense proposal.',
-        status: 400,
-      };
-    }
-
-    if (!project.institution_id) {
-      await conn.execute(
-        'UPDATE projects SET institution_id = ? WHERE id = ?',
-        [adviserInstitutionId, project_id]
-      );
-    } else if (project.institution_id !== adviserInstitutionId) {
-      await conn.rollback();
-      return {
-        error: 'Project institution does not match adviser institution.',
-        status: 403,
-      };
-    }
-
     const scheduleCheck = await validateScheduleConstraints({
       projectId: project_id,
       startAt: normalizedSchedule.dbValue,
       endAt: normalizedEnd.dbValue,
       location,
       fallbackTeacherId: userId,
-      statuses: submit_as_proposal ? ['approved', 'moved'] : ['scheduled', 'approved', 'moved'],
+      statuses: ['scheduled', 'approved', 'moved', 'pending'],
       scheduleSources,
       queryRunner: conn,
     });
 
-    let status = submit_as_proposal ? 'pending' : 'scheduled';
-    let blockedBy = null;
+    let status = 'scheduled';
     if (!scheduleCheck.ok) {
       const conflictPayload = buildConflictPayload(
         scheduleCheck.conflicts,
         normalizedSchedule,
         normalizedEnd,
-        'Schedule overlap detected. Review the remaining minutes and proceed only if needed.'
+        'Schedule overlap detected. Please choose a different schedule window.'
       );
 
-      if (submit_as_proposal && !force_proceed) {
+      if (!wait_for_slot) {
         await conn.rollback();
         return {
           ...conflictPayload,
@@ -559,25 +525,16 @@ async function createDefense(userId, payload) {
         };
       }
 
-      if (force_pending || submit_as_proposal || force_proceed) {
-        status = 'pending';
-        blockedBy = scheduleCheck.conflicts[0]?.defense_id || null;
-      } else {
-        await conn.rollback();
-        return {
-          ...conflictPayload,
-          status: 409,
-        };
-      }
+      status = 'pending';
     }
 
     const [idRows] = await conn.execute('SELECT UUID() AS id');
     const defenseId = idRows[0].id;
 
     await conn.execute(
-      `INSERT INTO ${ADVISER_BOOKING_TABLE} (id, project_id, defense_type, scheduled_at, end_time, location, modality, status, blocked_by, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [defenseId, project_id, defense_type, normalizedSchedule.dbValue, normalizedEnd.dbValue, location, modality || 'Online', status, blockedBy, userId]
+      `INSERT INTO ${ADVISER_BOOKING_TABLE} (id, project_id, defense_type, scheduled_at, end_time, location, modality, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [defenseId, project_id, defense_type, normalizedSchedule.dbValue, normalizedEnd.dbValue, location, modality || 'Online', status, userId]
     );
 
     const [rows] = await conn.execute(
@@ -587,12 +544,13 @@ async function createDefense(userId, payload) {
 
     await conn.commit();
 
-    // Adviser proposals should stay pending for coordinator review.
-    if (!submit_as_proposal) {
-      await processAllPendingDefenses();
-    }
-
-    return { data: rows[0] };
+    return {
+      data: rows[0],
+      queued: status === 'pending',
+      message: status === 'pending'
+        ? 'Meeting added to waiting queue. It will be auto-scheduled when conflicts clear.'
+        : undefined,
+    };
   } catch (err) {
     if (conn) {
       try {
@@ -670,7 +628,6 @@ async function cancelDefense(userId, defenseId) {
     [defenseId]
   );
 
-  await promotePendingDefenses(defenseId);
   await processAllPendingDefenses();
 
   const { rows: updatedRows } = await db.query(
@@ -691,86 +648,6 @@ async function cancelDefense(userId, defenseId) {
   );
 
   return { data: updatedRows[0] || null };
-}
-
-async function promotePendingDefenses(cancelledDefenseId) {
-  const { rows: pendingRows } = await db.query(
-    `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE blocked_by = ? AND status = 'pending'`,
-    [cancelledDefenseId]
-  );
-
-  for (const pending of pendingRows) {
-    const normalizedSchedule = normalizeDateTimeInput(pending.scheduled_at);
-    const normalizedEnd = normalizeDateTimeInput(pending.end_time || pending.scheduled_at);
-    if (!normalizedSchedule || !normalizedEnd) continue;
-
-    const recheck = await validateScheduleConstraints({
-      projectId: pending.project_id,
-      startAt: normalizedSchedule.dbValue,
-      endAt: normalizedEnd.dbValue,
-      location: pending.location,
-      fallbackTeacherId: pending.created_by,
-      statuses: ['scheduled', 'approved', 'moved'],
-      scheduleSources: [ADVISER_BOOKING_TABLE, 'defenses'],
-    });
-
-    if (recheck.ok) {
-      await db.query(
-        `UPDATE ${ADVISER_BOOKING_TABLE} SET status = 'scheduled', blocked_by = NULL WHERE id = ?`,
-        [pending.id]
-      );
-    }
-  }
-}
-
-async function processAllPendingDefenses() {
-  let conn;
-  try {
-    conn = await db.pool.getConnection();
-    await conn.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
-    await conn.beginTransaction();
-
-    const [pendingRows] = await conn.execute(
-      `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE status = 'pending' ORDER BY created_at ASC`
-    );
-
-    for (const pending of pendingRows) {
-      const normalizedSchedule = normalizeDateTimeInput(pending.scheduled_at);
-      const normalizedEnd = normalizeDateTimeInput(pending.end_time || pending.scheduled_at);
-      if (!normalizedSchedule || !normalizedEnd) continue;
-
-      const recheck = await validateScheduleConstraints({
-        projectId: pending.project_id,
-        startAt: normalizedSchedule.dbValue,
-        endAt: normalizedEnd.dbValue,
-        location: pending.location,
-        fallbackTeacherId: pending.created_by,
-        statuses: ['scheduled', 'approved', 'moved'],
-        scheduleSources: [ADVISER_BOOKING_TABLE, 'defenses'],
-        queryRunner: conn,
-      });
-
-      if (recheck.ok) {
-        await conn.execute(
-          `UPDATE ${ADVISER_BOOKING_TABLE} SET status = 'scheduled', blocked_by = NULL WHERE id = ?`,
-          [pending.id]
-        );
-      }
-    }
-
-    await conn.commit();
-  } catch (err) {
-    if (conn) {
-      try {
-        await conn.rollback();
-      } catch (e) {
-        console.error('processAllPending rollback error:', e);
-      }
-    }
-    console.error('processAllPendingDefenses error:', err);
-  } finally {
-    if (conn) conn.release();
-  }
 }
 
 async function rescheduleDefense(userId, defenseId, payload) {
@@ -839,7 +716,7 @@ async function rescheduleDefense(userId, defenseId, payload) {
 
     await conn.execute(
       `UPDATE ${ADVISER_BOOKING_TABLE}
-       SET scheduled_at = ?, end_time = ?, status = 'rescheduled', blocked_by = NULL
+       SET scheduled_at = ?, end_time = ?, status = 'rescheduled'
        WHERE id = ?`,
       [normalizedSchedule.dbValue, normalizedEnd.dbValue, defenseId]
     );
@@ -850,6 +727,7 @@ async function rescheduleDefense(userId, defenseId, payload) {
     );
 
     await conn.commit();
+
     await processAllPendingDefenses();
 
     return { data: updatedRows[0] };
@@ -863,6 +741,61 @@ async function rescheduleDefense(userId, defenseId, payload) {
     }
     console.error('rescheduleDefense error:', err);
     throw err;
+  } finally {
+    if (conn) conn.release();
+  }
+}
+
+async function processAllPendingDefenses() {
+  let conn;
+  try {
+    conn = await db.pool.getConnection();
+    await conn.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+    await conn.beginTransaction();
+
+    const [pendingRows] = await conn.execute(
+      `SELECT *
+       FROM ${ADVISER_BOOKING_TABLE}
+       WHERE status = 'pending'
+       ORDER BY created_at ASC`
+    );
+
+    for (const pending of pendingRows) {
+      const normalizedSchedule = normalizeDateTimeInput(pending.scheduled_at);
+      const normalizedEnd = normalizeDateTimeInput(pending.end_time || pending.scheduled_at);
+      if (!normalizedSchedule || !normalizedEnd) continue;
+
+      const scheduleCheck = await validateScheduleConstraints({
+        projectId: pending.project_id,
+        startAt: normalizedSchedule.dbValue,
+        endAt: normalizedEnd.dbValue,
+        location: pending.location,
+        fallbackTeacherId: pending.created_by,
+        statuses: ['scheduled', 'approved', 'moved'],
+        scheduleSources: [ADVISER_BOOKING_TABLE, 'defenses'],
+        queryRunner: conn,
+      });
+
+      if (scheduleCheck.ok) {
+        await conn.execute(
+          `UPDATE ${ADVISER_BOOKING_TABLE}
+           SET status = 'scheduled'
+           WHERE id = ?`,
+          [pending.id]
+        );
+      }
+    }
+
+    await conn.commit();
+  } catch (err) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (rollbackErr) {
+        console.error('processAllPendingDefenses rollback error:', rollbackErr);
+      }
+    }
+    console.error('processAllPendingDefenses error:', err);
   } finally {
     if (conn) conn.release();
   }

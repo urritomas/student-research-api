@@ -341,8 +341,7 @@ async function getPendingDefenses(institutionId) {
      INNER JOIN projects p ON d.project_id = p.id
      LEFT JOIN users u ON d.created_by = u.id
      WHERE p.institution_id = ?
-       AND d.verified_by IS NULL
-       AND d.status IN ('pending', 'scheduled')
+       AND d.status = 'pending'
      ORDER BY ${scheduleExpr} ASC`,
     [institutionId]
   );
@@ -358,11 +357,11 @@ async function getAllDefensesForInstitution(institutionId) {
             ${scheduleExpr} AS start_time,
             COALESCE(d.end_time, ${scheduleExpr}) AS end_time,
             u.full_name AS created_by_name,
-            vu.full_name AS verified_by_name
+            au.full_name AS adviser_name
      FROM defenses d
      INNER JOIN projects p ON d.project_id = p.id
      LEFT JOIN users u ON d.created_by = u.id
-     LEFT JOIN users vu ON d.verified_by = vu.id
+     LEFT JOIN users au ON d.adviser_id = au.id
      WHERE p.institution_id = ?
      ORDER BY ${scheduleExpr} DESC`,
     [institutionId]
@@ -430,17 +429,16 @@ async function verifyDefense(defenseId, coordinatorId, { venue, verifiedSchedule
     const newStatus = scheduleMoved ? 'moved' : 'approved';
     const notifType = scheduleMoved ? 'defense_moved' : 'defense_approved';
 
-    // Update defense with verification
+    // Update defense schedule and status without requiring verification columns.
     await conn.execute(
       `UPDATE defenses
-       SET verified_by = ?, verified_at = NOW(),
-           venue = COALESCE(?, venue),
+       SET venue = COALESCE(?, venue),
            scheduled_at = ?,
            end_time = ?,
            verified_schedule = ?,
            status = ?
        WHERE id = ?`,
-      [coordinatorId, venue || null, proposedStart, proposedEnd, proposedStart, newStatus, defenseId]
+      [venue || null, proposedStart, proposedEnd, proposedStart, newStatus, defenseId]
     );
 
     // Create verification audit record
@@ -511,8 +509,8 @@ async function rejectDefense(defenseId, coordinatorId, { notes }) {
   }
 
   await db.query(
-    `UPDATE defenses SET status = 'rejected', verified_by = ?, verified_at = NOW() WHERE id = ?`,
-    [coordinatorId, defenseId]
+    `UPDATE defenses SET status = 'rejected' WHERE id = ?`,
+    [defenseId]
   );
 
   if (notes) {
@@ -555,8 +553,8 @@ async function setDefenseVenue(defenseId, coordinatorId, venue) {
   }
 
   await db.query(
-    'UPDATE defenses SET venue = ?, verified_by = ?, verified_at = NOW() WHERE id = ?',
-    [venue, coordinatorId, defenseId]
+    'UPDATE defenses SET venue = ? WHERE id = ?',
+    [venue, defenseId]
   );
 
   return { data: { success: true } };
@@ -578,8 +576,7 @@ async function getCoordinatorStats(institutionId) {
       `SELECT COUNT(*) AS count FROM defenses d
        INNER JOIN projects p ON d.project_id = p.id
        WHERE p.institution_id = ?
-         AND d.verified_by IS NULL
-         AND d.status IN ('pending', 'scheduled')`,
+         AND d.status = 'pending'`,
       [institutionId]
     ),
     db.query(
@@ -612,7 +609,16 @@ async function createDefenseForCourse(institutionId, coordinatorId, payload) {
   }
 
   const { rows: projects } = await db.query(
-    'SELECT id, title, project_code FROM projects WHERE course_id = ? AND institution_id = ?',
+    `SELECT p.id, p.title, p.project_code,
+            (SELECT pm.user_id
+             FROM project_members pm
+             WHERE pm.project_id = p.id
+               AND pm.role = 'adviser'
+               AND pm.status = 'accepted'
+             ORDER BY pm.invited_at ASC
+             LIMIT 1) AS adviser_id
+     FROM projects p
+     WHERE p.course_id = ? AND p.institution_id = ?`,
     [courseId, institutionId]
   );
 
@@ -623,10 +629,12 @@ async function createDefenseForCourse(institutionId, coordinatorId, payload) {
   const createdDefenses = [];
 
   for (const project of projects) {
+    const adviserId = project.adviser_id || coordinatorId;
+
     await db.query(
-      `INSERT INTO defenses (id, project_id, defense_type, scheduled_at, location, venue, status, verified_by, verified_at, created_by)
-       VALUES (UUID(), ?, ?, ?, ?, ?, 'scheduled', ?, NOW(), ?)`,
-      [project.id, defenseType, scheduledAt, location, venue || null, coordinatorId, coordinatorId]
+      `INSERT INTO defenses (id, project_id, adviser_id, defense_type, scheduled_at, location, venue, status, created_by)
+       VALUES (UUID(), ?, ?, ?, ?, ?, ?, 'scheduled', ?)`,
+      [project.id, adviserId, defenseType, scheduledAt, location, venue || null, coordinatorId]
     );
 
     const { rows: defenseRows } = await db.query(

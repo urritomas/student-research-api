@@ -99,6 +99,7 @@ function buildConflictPayload(conflicts, normalizedStart, normalizedEnd, message
 
     return {
       domain: conflict.domain,
+      source_table: conflict.source_table,
       defense_id: conflict.defense_id,
       project_id: conflict.project_id,
       start_time: conflict.start_time,
@@ -133,17 +134,114 @@ async function queryRows(queryRunner, sql, params) {
   return result.rows;
 }
 
-function buildOverlapConflicts(intervals, candidateStart, candidateEnd) {
-  const conflictingIntervals = intervals.filter((interval) => {
-    const startDate = toDate(interval.start_time);
-    const endDate = toDate(interval.end_time || interval.start_time);
-    if (!startDate || !endDate) return false;
-    return startDate < candidateEnd && endDate > candidateStart;
-  });
+const SCHEDULE_SOURCE_CONFIG = {
+  meetings: {
+    tableName: 'meetings',
+    startCandidates: ['scheduled_at', 'start_time', 'meeting_start', 'meeting_time', 'created_at'],
+    endCandidates: ['end_time', 'meeting_end'],
+    locationCandidates: ['venue', 'location', 'room'],
+    statusCandidates: ['status'],
+  },
+  defenses: {
+    tableName: 'defenses',
+    startCandidates: ['scheduled_at', 'verified_schedule', 'proposed_schedule', 'created_at'],
+    endCandidates: ['end_time'],
+    locationCandidates: ['venue', 'location'],
+    statusCandidates: ['status'],
+  },
+};
 
+const scheduleSourceCache = new Map();
+
+function pickFirstExistingColumn(columns, candidates) {
+  for (const candidate of candidates) {
+    if (columns.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+function buildInClausePlaceholders(items) {
+  return items.map(() => '?').join(', ');
+}
+
+async function getTableColumns(tableName, queryRunner = db) {
+  const rows = await queryRows(
+    queryRunner,
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = ?`,
+    [tableName]
+  );
+
+  return new Set(rows.map((row) => row.COLUMN_NAME));
+}
+
+function buildCoalesceExpr(alias, columns, candidates) {
+  const parts = candidates
+    .filter((candidate) => columns.has(candidate))
+    .map((candidate) => `${alias}.${candidate}`);
+
+  if (!parts.length) return null;
+  if (parts.length === 1) return parts[0];
+  return `COALESCE(${parts.join(', ')})`;
+}
+
+async function resolveScheduleSource(sourceName, queryRunner = db) {
+  if (!sourceName || !SCHEDULE_SOURCE_CONFIG[sourceName]) {
+    return null;
+  }
+
+  if (scheduleSourceCache.has(sourceName)) {
+    return scheduleSourceCache.get(sourceName);
+  }
+
+  const config = SCHEDULE_SOURCE_CONFIG[sourceName];
+  const columns = await getTableColumns(config.tableName, queryRunner);
+  if (!columns.size) {
+    scheduleSourceCache.set(sourceName, null);
+    return null;
+  }
+
+  if (!columns.has('id') || !columns.has('project_id')) {
+    scheduleSourceCache.set(sourceName, null);
+    return null;
+  }
+
+  const alias = 's';
+  const startExpr = buildCoalesceExpr(alias, columns, config.startCandidates);
+  if (!startExpr) {
+    scheduleSourceCache.set(sourceName, null);
+    return null;
+  }
+
+  const endExpr = buildCoalesceExpr(alias, columns, config.endCandidates) || startExpr;
+  const locationExpr = buildCoalesceExpr(alias, columns, config.locationCandidates);
+  const statusColumn = pickFirstExistingColumn(columns, config.statusCandidates);
+
+  const resolved = {
+    key: sourceName,
+    tableName: config.tableName,
+    alias,
+    startExpr,
+    endExpr,
+    locationExpr,
+    statusColumn,
+  };
+
+  scheduleSourceCache.set(sourceName, resolved);
+  return resolved;
+}
+
+function buildStatusFilterClause(source, statuses) {
+  if (!source.statusColumn || !statuses?.length) {
+    return { sql: '', params: [] };
+  }
+
+  const placeholders = buildInClausePlaceholders(statuses);
   return {
-    hasConflict: conflictingIntervals.length > 0,
-    conflictingIntervals,
+    sql: ` AND ${source.alias}.${source.statusColumn} IN (${placeholders})`,
+    params: [...statuses],
   };
 }
 
@@ -177,85 +275,131 @@ async function getProjectMemberGroups(projectId, fallbackUserId, queryRunner = d
   };
 }
 
-function buildInClausePlaceholders(items) {
-  return items.map(() => '?').join(', ');
+async function getProjectSchedulesForSource(source, projectId, startAt, endAt, statuses, queryRunner = db) {
+  const statusFilter = buildStatusFilterClause(source, statuses);
+  const rows = await queryRows(
+    queryRunner,
+    `SELECT ${source.alias}.id, ${source.alias}.project_id,
+            ${source.startExpr} AS start_time,
+            ${source.endExpr} AS end_time,
+            ${source.locationExpr || 'NULL'} AS location,
+            ? AS source_table
+     FROM ${source.tableName} ${source.alias}
+     WHERE ${source.alias}.project_id = ?
+       ${statusFilter.sql}
+       AND ${source.startExpr} < ?
+       AND ${source.endExpr} > ?`,
+    [source.tableName, projectId, ...statusFilter.params, endAt, startAt]
+  );
+
+  return rows;
 }
 
-async function getParticipantSchedules(userIds, startAt, endAt, statuses, queryRunner = db) {
+async function getRoomSchedulesForSource(source, location, startAt, endAt, statuses, queryRunner = db) {
+  if (!source.locationExpr || !location || location.toLowerCase() === 'online') {
+    return [];
+  }
+
+  const statusFilter = buildStatusFilterClause(source, statuses);
+  const rows = await queryRows(
+    queryRunner,
+    `SELECT ${source.alias}.id, ${source.alias}.project_id,
+            ${source.startExpr} AS start_time,
+            ${source.endExpr} AS end_time,
+            ${source.locationExpr} AS location,
+            ? AS source_table
+     FROM ${source.tableName} ${source.alias}
+     WHERE ${source.locationExpr} = ?
+       ${statusFilter.sql}
+       AND ${source.startExpr} < ?
+       AND ${source.endExpr} > ?`,
+    [source.tableName, location, ...statusFilter.params, endAt, startAt]
+  );
+
+  return rows;
+}
+
+async function getParticipantSchedulesForSource(source, userIds, startAt, endAt, statuses, queryRunner = db) {
   if (!userIds.length) {
     return [];
   }
 
   const placeholders = buildInClausePlaceholders(userIds);
-  const statusPlaceholders = buildInClausePlaceholders(statuses);
+  const statusFilter = buildStatusFilterClause(source, statuses);
   const rows = await queryRows(
     queryRunner,
-    `SELECT DISTINCT d.id, d.project_id, d.scheduled_at AS start_time,
-            COALESCE(d.end_time, d.scheduled_at) AS end_time,
-            d.location, pm.user_id AS participant_id
-     FROM defenses d
+    `SELECT DISTINCT ${source.alias}.id, ${source.alias}.project_id,
+            ${source.startExpr} AS start_time,
+            ${source.endExpr} AS end_time,
+            ${source.locationExpr || 'NULL'} AS location,
+            pm.user_id AS participant_id,
+            ? AS source_table
+     FROM ${source.tableName} ${source.alias}
      JOIN project_members pm
-       ON pm.project_id = d.project_id
+       ON pm.project_id = ${source.alias}.project_id
       AND pm.status = 'accepted'
      WHERE pm.user_id IN (${placeholders})
-       AND d.status IN (${statusPlaceholders})
-       AND d.scheduled_at < ?
-       AND COALESCE(d.end_time, d.scheduled_at) > ?`,
-    [...userIds, ...statuses, endAt, startAt]
+       ${statusFilter.sql}
+       AND ${source.startExpr} < ?
+       AND ${source.endExpr} > ?`,
+    [source.tableName, ...userIds, ...statusFilter.params, endAt, startAt]
   );
 
   return rows;
 }
 
-async function getRoomSchedules(location, startAt, endAt, statuses, queryRunner = db) {
-  if (!location || location.toLowerCase() === 'online') {
-    return [];
+function buildOverlapConflicts(intervals, candidateStart, candidateEnd) {
+  const conflictingIntervals = intervals.filter((interval) => {
+    const startDate = toDate(interval.start_time);
+    const endDate = toDate(interval.end_time || interval.start_time);
+    if (!startDate || !endDate) return false;
+    return startDate < candidateEnd && endDate > candidateStart;
+  });
+
+  return {
+    hasConflict: conflictingIntervals.length > 0,
+    conflictingIntervals,
+  };
+}
+
+function normalizeScheduleSources(scheduleSources) {
+  const list = Array.isArray(scheduleSources)
+    ? scheduleSources
+    : [scheduleSources];
+
+  const normalized = list
+    .map((item) => String(item || '').trim().toLowerCase())
+    .filter(Boolean)
+    .filter((item, index, arr) => arr.indexOf(item) === index)
+    .filter((item) => Boolean(SCHEDULE_SOURCE_CONFIG[item]));
+
+  return normalized.length ? normalized : ['defenses'];
+}
+
+function resolveBookingScheduleSources(payload = {}) {
+  const explicitSources = payload.schedule_sources || payload.schedule_source;
+  if (explicitSources) {
+    return normalizeScheduleSources(explicitSources);
   }
 
-  const statusPlaceholders = buildInClausePlaceholders(statuses);
-  const rows = await queryRows(
-    queryRunner,
-    `SELECT id, project_id, scheduled_at AS start_time,
-            COALESCE(end_time, scheduled_at) AS end_time, location
-     FROM defenses
-     WHERE status IN (${statusPlaceholders})
-       AND location = ?
-       AND scheduled_at < ?
-       AND COALESCE(end_time, scheduled_at) > ?`,
-    [...statuses, location, endAt, startAt]
-  );
+  // Adviser legacy flow still relies on meetings data.
+  if (payload.submit_as_proposal || payload.booking_side === 'adviser' || payload.use_legacy_meetings) {
+    return ['meetings', 'defenses'];
+  }
 
-  return rows;
+  return ['defenses'];
 }
 
-async function getProjectSchedules(projectId, startAt, endAt, statuses, queryRunner = db) {
-  const statusPlaceholders = buildInClausePlaceholders(statuses);
-  const rows = await queryRows(
-    queryRunner,
-    `SELECT id, project_id, scheduled_at AS start_time,
-            COALESCE(end_time, scheduled_at) AS end_time, location
-     FROM defenses
-     WHERE project_id = ?
-       AND status IN (${statusPlaceholders})
-       AND scheduled_at < ?
-       AND COALESCE(end_time, scheduled_at) > ?`,
-    [projectId, ...statuses, endAt, startAt]
-  );
-  return rows;
-}
-
-async function validateScheduleConstraints({ projectId, startAt, endAt, location, fallbackTeacherId, statuses, queryRunner = db }) {
-  const [projectSchedules, roomSchedules, memberGroups] = await Promise.all([
-    getProjectSchedules(projectId, startAt, endAt, statuses, queryRunner),
-    getRoomSchedules(location, startAt, endAt, statuses, queryRunner),
-    getProjectMemberGroups(projectId, fallbackTeacherId, queryRunner),
-  ]);
-
-  const [teacherSchedules, studentSchedules] = await Promise.all([
-    getParticipantSchedules(memberGroups.teacherIds, startAt, endAt, statuses, queryRunner),
-    getParticipantSchedules(memberGroups.studentIds, startAt, endAt, statuses, queryRunner),
-  ]);
-
+async function validateScheduleConstraints({
+  projectId,
+  startAt,
+  endAt,
+  location,
+  fallbackTeacherId,
+  statuses,
+  scheduleSources,
+  queryRunner = db,
+}) {
   const allConflicts = [];
   const candidateStart = toDate(startAt);
   const candidateEnd = toDate(endAt);
@@ -263,25 +407,51 @@ async function validateScheduleConstraints({ projectId, startAt, endAt, location
     return { ok: false, conflicts: [] };
   }
 
-  const checks = [
-    { label: 'project', result: buildOverlapConflicts(projectSchedules, candidateStart, candidateEnd) },
-    { label: 'room', result: buildOverlapConflicts(roomSchedules, candidateStart, candidateEnd) },
-    { label: 'teacher', result: buildOverlapConflicts(teacherSchedules, candidateStart, candidateEnd) },
-    { label: 'student', result: buildOverlapConflicts(studentSchedules, candidateStart, candidateEnd) },
-  ];
+  const requestedSources = normalizeScheduleSources(scheduleSources);
+  const resolvedSources = [];
 
-  for (const { label, result } of checks) {
-    if (result.hasConflict) {
-      for (const interval of result.conflictingIntervals) {
-        allConflicts.push({
-          domain: label,
-          defense_id: interval.id,
-          project_id: interval.project_id,
-          start_time: interval.start_time,
-          end_time: interval.end_time,
-          start_date: toDate(interval.start_time),
-          end_date: toDate(interval.end_time || interval.start_time),
-        });
+  for (const sourceName of requestedSources) {
+    const resolved = await resolveScheduleSource(sourceName, queryRunner);
+    if (resolved) {
+      resolvedSources.push(resolved);
+    }
+  }
+
+  if (!resolvedSources.length) {
+    return { ok: true, conflicts: [] };
+  }
+
+  const memberGroups = await getProjectMemberGroups(projectId, fallbackTeacherId, queryRunner);
+
+  for (const source of resolvedSources) {
+    const [projectSchedules, roomSchedules, teacherSchedules, studentSchedules] = await Promise.all([
+      getProjectSchedulesForSource(source, projectId, startAt, endAt, statuses, queryRunner),
+      getRoomSchedulesForSource(source, location, startAt, endAt, statuses, queryRunner),
+      getParticipantSchedulesForSource(source, memberGroups.teacherIds, startAt, endAt, statuses, queryRunner),
+      getParticipantSchedulesForSource(source, memberGroups.studentIds, startAt, endAt, statuses, queryRunner),
+    ]);
+
+    const checks = [
+      { label: 'project', result: buildOverlapConflicts(projectSchedules, candidateStart, candidateEnd) },
+      { label: 'room', result: buildOverlapConflicts(roomSchedules, candidateStart, candidateEnd) },
+      { label: 'teacher', result: buildOverlapConflicts(teacherSchedules, candidateStart, candidateEnd) },
+      { label: 'student', result: buildOverlapConflicts(studentSchedules, candidateStart, candidateEnd) },
+    ];
+
+    for (const { label, result } of checks) {
+      if (result.hasConflict) {
+        for (const interval of result.conflictingIntervals) {
+          allConflicts.push({
+            domain: label,
+            source_table: interval.source_table || source.tableName,
+            defense_id: interval.id,
+            project_id: interval.project_id,
+            start_time: interval.start_time,
+            end_time: interval.end_time,
+            start_date: toDate(interval.start_time),
+            end_date: toDate(interval.end_time || interval.start_time),
+          });
+        }
       }
     }
   }
@@ -308,6 +478,7 @@ async function createDefense(userId, payload) {
 
     const normalizedSchedule = scheduleWindow.start;
     const normalizedEnd = scheduleWindow.end;
+    const scheduleSources = resolveBookingScheduleSources(payload);
 
     conn = await db.pool.getConnection();
     await conn.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
@@ -364,6 +535,7 @@ async function createDefense(userId, payload) {
       location,
       fallbackTeacherId: userId,
       statuses: submit_as_proposal ? ['approved', 'moved'] : ['scheduled', 'approved', 'moved'],
+      scheduleSources,
       queryRunner: conn,
     });
 
@@ -387,7 +559,7 @@ async function createDefense(userId, payload) {
 
       if (force_pending || submit_as_proposal || force_proceed) {
         status = 'pending';
-        blockedBy = scheduleCheck.conflicts[0]?.defense_id || null;
+        blockedBy = scheduleCheck.conflicts.find((conflict) => conflict.source_table === 'defenses')?.defense_id || null;
       } else {
         await conn.rollback();
         return {
@@ -537,6 +709,7 @@ async function promotePendingDefenses(cancelledDefenseId) {
       location: pending.location,
       fallbackTeacherId: pending.created_by,
       statuses: ['scheduled', 'approved', 'moved'],
+      scheduleSources: ['defenses'],
     });
 
     if (recheck.ok) {
@@ -571,6 +744,7 @@ async function processAllPendingDefenses() {
         location: pending.location,
         fallbackTeacherId: pending.created_by,
         statuses: ['scheduled', 'approved', 'moved'],
+        scheduleSources: ['defenses'],
         queryRunner: conn,
       });
 
@@ -644,6 +818,7 @@ async function rescheduleDefense(userId, defenseId, payload) {
       location: defense.location,
       fallbackTeacherId: userId,
       statuses: ['scheduled', 'approved', 'moved'],
+      scheduleSources: ['defenses'],
       queryRunner: conn,
     });
 

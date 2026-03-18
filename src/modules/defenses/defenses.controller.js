@@ -1,7 +1,10 @@
 const { createDefense, getDefensesByUser, getDefensesForMember, cancelDefense, rescheduleDefense } = require('./defenses.service');
 
 async function postDefense(req, res) {
-  const result = await createDefense(req.user.id, req.body || {});
+  const result = await createDefense(req.user.id, {
+    ...(req.body || {}),
+    booking_side: 'adviser',
+  });
   if (result.error) {
     return res.status(result.status || 400).json({ error: result.error });
   }
@@ -16,6 +19,7 @@ async function postDefenseProposal(req, res) {
   const body = req.body || {};
   const result = await createDefense(req.user.id, {
     ...body,
+    booking_side: 'adviser',
     submit_as_proposal: true,
     force_pending: Boolean(body.force_proceed),
     force_proceed: Boolean(body.force_proceed),

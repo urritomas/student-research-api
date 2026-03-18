@@ -30,14 +30,15 @@ async function getAdvisers(req, res) {
 }
 
 async function addAdviser(req, res) {
-  const { adviserId } = req.body;
-  if (!adviserId) {
-    return res.status(400).json({ error: 'adviserId is required' });
+  const { adviserId, courseId } = req.body;
+  if (!adviserId || !courseId) {
+    return res.status(400).json({ error: 'adviserId and courseId are required' });
   }
 
   const result = await coordinatorService.addAdviserToInstitution(
     req.institution.id,
     adviserId,
+    courseId,
     req.user.id
   );
 

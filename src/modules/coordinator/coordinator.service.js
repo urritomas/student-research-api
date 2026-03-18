@@ -283,7 +283,26 @@ async function getAdvisersInInstitution(institutionId) {
   return rows;
 }
 
-async function addAdviserToInstitution(institutionId, adviserId, coordinatorId) {
+async function addAdviserToInstitution(institutionId, adviserId, courseId, coordinatorId) {
+  if (!courseId) {
+    return { error: 'courseId is required' };
+  }
+
+  const { rows: courseCountRows } = await db.query(
+    'SELECT COUNT(*) AS count FROM courses WHERE institution_id = ?',
+    [institutionId]
+  );
+
+  const courseCount = Number(courseCountRows[0]?.count || 0);
+  if (courseCount === 0) {
+    return { error: 'Create at least one course before inviting advisers.' };
+  }
+
+  const course = await getCourseById(courseId);
+  if (!course || course.institution_id !== institutionId) {
+    return { error: 'Course not found in your institution' };
+  }
+
   // Verify the adviser exists and has adviser role
   const { rows: roleRows } = await db.query(
     `SELECT ur.id, ur.institution_id
@@ -297,16 +316,36 @@ async function addAdviserToInstitution(institutionId, adviserId, coordinatorId) 
     return { error: 'User is not an adviser' };
   }
 
-  if (roleRows[0].institution_id === institutionId) {
-    return { error: 'Adviser is already in this institution' };
+  if (roleRows[0].institution_id !== institutionId) {
+    await db.query(
+      'UPDATE user_roles SET institution_id = ? WHERE id = ?',
+      [institutionId, roleRows[0].id]
+    );
   }
 
-  await db.query(
-    'UPDATE user_roles SET institution_id = ? WHERE id = ?',
-    [institutionId, roleRows[0].id]
+  const assignmentResult = await db.query(
+    `INSERT INTO project_members (id, project_id, user_id, role, status, invited_at, responded_at)
+     SELECT UUID(), p.id, ?, 'adviser', 'accepted', NOW(), NOW()
+     FROM projects p
+     WHERE p.institution_id = ?
+       AND p.course_id = ?
+       AND NOT EXISTS (
+         SELECT 1
+         FROM project_members pm
+         WHERE pm.project_id = p.id
+           AND pm.user_id = ?
+           AND pm.role = 'adviser'
+       )`,
+    [adviserId, institutionId, courseId, adviserId]
   );
 
-  return { data: { success: true } };
+  return {
+    data: {
+      success: true,
+      course_id: courseId,
+      assigned_projects: assignmentResult.rows?.affectedRows || 0,
+    },
+  };
 }
 
 async function removeAdviserFromInstitution(institutionId, adviserId) {
@@ -680,14 +719,7 @@ async function createDefenseForCourse(institutionId, coordinatorId, payload) {
   }
 
   const { rows: projects } = await db.query(
-    `SELECT p.id, p.title, p.project_code,
-            (SELECT pm.user_id
-             FROM project_members pm
-             WHERE pm.project_id = p.id
-               AND pm.role = 'adviser'
-               AND pm.status = 'accepted'
-             ORDER BY pm.invited_at ASC
-             LIMIT 1) AS adviser_id
+    `SELECT p.id, p.title, p.project_code
      FROM projects p
      WHERE p.course_id = ? AND p.institution_id = ?`,
     [courseId, institutionId]
@@ -700,21 +732,40 @@ async function createDefenseForCourse(institutionId, coordinatorId, payload) {
   const createdDefenses = [];
 
   for (const project of projects) {
-    const adviserId = project.adviser_id || coordinatorId;
-
-    await db.query(
-      `INSERT INTO defenses (id, project_id, adviser_id, defense_type, scheduled_at, location, venue, status, created_by)
-       VALUES (UUID(), ?, ?, ?, ?, ?, ?, 'scheduled', ?)`,
-      [project.id, adviserId, defenseType, scheduledAt, location, venue || null, coordinatorId]
+    const { rows: adviserRows } = await db.query(
+      `SELECT DISTINCT pm.user_id
+       FROM project_members pm
+       WHERE pm.project_id = ?
+         AND pm.role = 'adviser'
+         AND pm.status = 'accepted'`,
+      [project.id]
     );
 
-    const { rows: defenseRows } = await db.query(
-      'SELECT * FROM defenses WHERE project_id = ? AND created_by = ? ORDER BY created_at DESC LIMIT 1',
-      [project.id, coordinatorId]
-    );
+    const adviserIds = adviserRows.length
+      ? adviserRows.map((row) => row.user_id)
+      : [coordinatorId];
 
-    if (defenseRows[0]) {
-      createdDefenses.push({ ...defenseRows[0], project_title: project.title, project_code: project.project_code });
+    for (const adviserId of adviserIds) {
+      await db.query(
+        `INSERT INTO defenses (id, project_id, adviser_id, defense_type, scheduled_at, location, venue, status, created_by)
+         VALUES (UUID(), ?, ?, ?, ?, ?, ?, 'scheduled', ?)`,
+        [project.id, adviserId, defenseType, scheduledAt, location, venue || null, coordinatorId]
+      );
+
+      const { rows: defenseRows } = await db.query(
+        `SELECT *
+         FROM defenses
+         WHERE project_id = ?
+           AND adviser_id = ?
+           AND created_by = ?
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [project.id, adviserId, coordinatorId]
+      );
+
+      if (defenseRows[0]) {
+        createdDefenses.push({ ...defenseRows[0], project_title: project.title, project_code: project.project_code });
+      }
     }
 
     const { rows: members } = await db.query(

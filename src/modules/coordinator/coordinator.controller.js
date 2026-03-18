@@ -172,6 +172,24 @@ async function createDefenseForCourse(req, res) {
   return res.status(201).json(result.data);
 }
 
+async function bookDefenseSchedule(req, res) {
+  const result = await coordinatorService.createCoordinatorDefenseBooking(
+    req.institution.id,
+    req.user.id,
+    req.body || {}
+  );
+
+  if (result.error) {
+    return res.status(result.status || 400).json({ error: result.error });
+  }
+
+  if (result.data?.conflict) {
+    return res.status(409).json(result.data);
+  }
+
+  return res.status(201).json(result.data);
+}
+
 async function getInstitutionProjects(req, res) {
   const projects = await coordinatorService.getProjectsByInstitution(req.institution.id);
   return res.json(projects);
@@ -199,6 +217,7 @@ module.exports = {
   rejectDefense,
   setVenue,
   createDefenseForCourse,
+  bookDefenseSchedule,
   getInstitutionProjects,
   getProjectsByAdviser,
 };

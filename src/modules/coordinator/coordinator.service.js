@@ -48,6 +48,77 @@ function toDate(value) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+function formatDateToDbUtc(date) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+}
+
+function normalizeDateTimeInput(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return {
+      dbValue: formatDateToDbUtc(value),
+      dateValue: value,
+    };
+  }
+
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  // Keep local wall-clock values unchanged for DATETIME columns.
+  const localNoZone = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(:\d{2})?$/;
+  const localMatch = trimmed.match(localNoZone);
+  if (localMatch) {
+    const datePart = localMatch[1];
+    const timePart = localMatch[2];
+    const secondsPart = localMatch[3] || ':00';
+    const parsed = toDate(`${datePart}T${timePart}${secondsPart}`);
+    if (!parsed) return null;
+
+    return {
+      dbValue: `${datePart} ${timePart}${secondsPart}`,
+      dateValue: parsed,
+    };
+  }
+
+  const parsed = toDate(trimmed);
+  if (!parsed) return null;
+
+  return {
+    dbValue: formatDateToDbUtc(parsed),
+    dateValue: parsed,
+  };
+}
+
+function getScheduleWindow(payload = {}) {
+  const startInput = payload.start_time ?? payload.scheduled_at ?? payload.scheduledAt ?? null;
+  const endInput = payload.end_time ?? payload.endTime ?? null;
+
+  if (!startInput) {
+    return { error: 'start_time is required' };
+  }
+
+  if (!endInput) {
+    return { error: 'end_time is required' };
+  }
+
+  const start = normalizeDateTimeInput(startInput);
+  if (!start) {
+    return { error: 'start_time must be a valid datetime value' };
+  }
+
+  const end = normalizeDateTimeInput(endInput);
+  if (!end) {
+    return { error: 'end_time must be a valid datetime value' };
+  }
+
+  if (end.dateValue <= start.dateValue) {
+    return { error: 'end_time must be after start_time' };
+  }
+
+  return { start, end };
+}
+
 function computeOverlapMinutes(rangeStart, rangeEnd, candidateStart, candidateEnd) {
   const overlapStart = Math.max(rangeStart.getTime(), candidateStart.getTime());
   const overlapEnd = Math.min(rangeEnd.getTime(), candidateEnd.getTime());
@@ -86,7 +157,7 @@ function buildCoordinatorConflictPayload(conflicts, startDate, endDate) {
   };
 }
 
-async function getCoordinatorApprovalConflicts({ defenseId, projectId, memberIds, location, startAt, endAt, queryRunner }) {
+async function getCoordinatorApprovalConflicts({ defenseId = null, projectId, memberIds, location, startAt, endAt, queryRunner }) {
   const statuses = ['approved', 'moved', 'scheduled'];
   const allConflicts = [];
 
@@ -95,12 +166,12 @@ async function getCoordinatorApprovalConflicts({ defenseId, projectId, memberIds
             scheduled_at AS start_time,
             COALESCE(end_time, scheduled_at) AS end_time
      FROM defenses
-     WHERE id <> ?
+     WHERE (? IS NULL OR id <> ?)
        AND project_id = ?
        AND status IN (?, ?, ?)
        AND scheduled_at < ?
        AND COALESCE(end_time, scheduled_at) > ?`,
-    [defenseId, projectId, ...statuses, endAt, startAt]
+    [defenseId, defenseId, projectId, ...statuses, endAt, startAt]
   );
 
   for (const row of projectRows) {
@@ -121,12 +192,12 @@ async function getCoordinatorApprovalConflicts({ defenseId, projectId, memberIds
               scheduled_at AS start_time,
               COALESCE(end_time, scheduled_at) AS end_time
        FROM defenses
-       WHERE id <> ?
+       WHERE (? IS NULL OR id <> ?)
          AND status IN (?, ?, ?)
          AND COALESCE(venue, location) = ?
          AND scheduled_at < ?
          AND COALESCE(end_time, scheduled_at) > ?`,
-      [defenseId, ...statuses, location, endAt, startAt]
+      [defenseId, defenseId, ...statuses, location, endAt, startAt]
     );
 
     for (const row of locationRows) {
@@ -152,12 +223,12 @@ async function getCoordinatorApprovalConflicts({ defenseId, projectId, memberIds
        JOIN project_members pm
          ON pm.project_id = d.project_id
         AND pm.status = 'accepted'
-       WHERE d.id <> ?
+       WHERE (? IS NULL OR d.id <> ?)
          AND pm.user_id IN (${memberPlaceholders})
          AND d.status IN (?, ?, ?)
          AND d.scheduled_at < ?
          AND COALESCE(d.end_time, d.scheduled_at) > ?`,
-      [defenseId, ...memberIds, ...statuses, endAt, startAt]
+      [defenseId, defenseId, ...memberIds, ...statuses, endAt, startAt]
     );
 
     for (const row of participantRows) {
@@ -668,6 +739,135 @@ async function createDefenseForCourse(institutionId, coordinatorId, payload) {
   return { data: { count: createdDefenses.length, defenses: createdDefenses } };
 }
 
+async function createCoordinatorDefenseBooking(institutionId, coordinatorId, payload) {
+  const {
+    projectId,
+    project_id,
+    defenseType,
+    defense_type,
+    location,
+    venue,
+    modality,
+    forceApprove,
+  } = payload || {};
+
+  const resolvedProjectId = projectId || project_id;
+  const resolvedDefenseType = defenseType || defense_type;
+  const scheduleWindow = getScheduleWindow(payload || {});
+
+  if (!resolvedProjectId) return { error: 'projectId is required', status: 400 };
+  if (!resolvedDefenseType || !['proposal', 'midterm', 'final'].includes(resolvedDefenseType)) {
+    return { error: 'defenseType must be one of: proposal, midterm, final', status: 400 };
+  }
+  if (scheduleWindow.error) return { error: scheduleWindow.error, status: 400 };
+  if (!location) return { error: 'location is required', status: 400 };
+
+  const { rows: projectRows } = await db.query(
+    `SELECT id, title, project_code
+     FROM projects
+     WHERE id = ? AND institution_id = ?
+     LIMIT 1`,
+    [resolvedProjectId, institutionId]
+  );
+
+  const project = projectRows[0];
+  if (!project) {
+    return { error: 'Project not found in your institution', status: 404 };
+  }
+
+  const normalizedStart = scheduleWindow.start;
+  const normalizedEnd = scheduleWindow.end;
+
+  const conn = await db.pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [memberRows] = await conn.execute(
+      `SELECT user_id
+       FROM project_members
+       WHERE project_id = ?
+         AND status = 'accepted'`,
+      [resolvedProjectId]
+    );
+
+    const targetVenue = venue || location;
+    const conflicts = await getCoordinatorApprovalConflicts({
+      defenseId: null,
+      projectId: resolvedProjectId,
+      memberIds: memberRows.map((member) => member.user_id),
+      location: targetVenue,
+      startAt: normalizedStart.dbValue,
+      endAt: normalizedEnd.dbValue,
+      queryRunner: conn,
+    });
+
+    if (conflicts.length && !forceApprove) {
+      await conn.rollback();
+      return {
+        data: buildCoordinatorConflictPayload(conflicts, normalizedStart.dateValue, normalizedEnd.dateValue),
+      };
+    }
+
+    const [idRows] = await conn.execute('SELECT UUID() AS id');
+    const defenseId = idRows[0].id;
+
+    await conn.execute(
+      `INSERT INTO defenses (
+        id, project_id, defense_type, scheduled_at, end_time, location, venue, modality,
+        status, verified_by, verified_at, verified_schedule, created_by
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?, NOW(), ?, ?)`,
+      [
+        defenseId,
+        resolvedProjectId,
+        resolvedDefenseType,
+        normalizedStart.dbValue,
+        normalizedEnd.dbValue,
+        location,
+        venue || null,
+        modality || 'Online',
+        coordinatorId,
+        normalizedStart.dbValue,
+        coordinatorId,
+      ]
+    );
+
+    const dateStr = normalizedStart.dateValue.toLocaleDateString();
+    const timeStr = normalizedStart.dateValue.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const notifTitle = `${resolvedDefenseType.charAt(0).toUpperCase() + resolvedDefenseType.slice(1)} Defense Scheduled`;
+    const notifMessage = `The ${resolvedDefenseType} defense for "${project.title}" has been scheduled on ${dateStr} at ${timeStr}.`;
+
+    for (const member of memberRows) {
+      await createNotification({
+        userId: member.user_id,
+        type: 'schedule',
+        title: notifTitle,
+        message: notifMessage,
+        metadata: { defenseId, projectId: resolvedProjectId, schedule: normalizedStart.dbValue },
+        conn,
+      });
+    }
+
+    await conn.commit();
+
+    const { rows: createdRows } = await db.query(
+      `SELECT d.*, p.title AS project_title, p.project_code
+       FROM defenses d
+       JOIN projects p ON p.id = d.project_id
+       WHERE d.id = ?
+       LIMIT 1`,
+      [defenseId]
+    );
+
+    return { data: createdRows[0] };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
 async function getProjectsByInstitution(institutionId) {
   const { rows } = await db.query(
     `SELECT
@@ -742,6 +942,7 @@ module.exports = {
   setDefenseVenue,
   getCoordinatorStats,
   createDefenseForCourse,
+  createCoordinatorDefenseBooking,
   getProjectsByInstitution,
   getProjectsByAdviserInInstitution,
 };

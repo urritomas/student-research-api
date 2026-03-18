@@ -32,6 +32,7 @@ router.delete('/courses/:courseId', asyncHandler(controller.deleteCourse));
 // Defense verification
 router.get('/defenses', asyncHandler(controller.listAllDefenses));
 router.get('/defenses/pending', asyncHandler(controller.listPendingDefenses));
+router.post('/defenses/book', asyncHandler(controller.bookDefenseSchedule));
 router.post('/defenses/:defenseId/verify', asyncHandler(controller.verifyDefense));
 router.post('/defenses/:defenseId/reject', asyncHandler(controller.rejectDefense));
 router.patch('/defenses/:defenseId/venue', asyncHandler(controller.setVenue));

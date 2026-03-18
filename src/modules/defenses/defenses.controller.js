@@ -1,8 +1,13 @@
 const { createDefense, getDefensesByUser, getDefensesForMember, cancelDefense, rescheduleDefense } = require('./defenses.service');
 
 async function postDefense(req, res) {
+  const body = req.body || {};
+  const waitForSlotRaw = body.wait_for_slot ?? body.waitForSlot;
+  const waitForSlot = waitForSlotRaw === true || waitForSlotRaw === 'true' || waitForSlotRaw === 1 || waitForSlotRaw === '1';
+
   const result = await createDefense(req.user.id, {
-    ...(req.body || {}),
+    ...body,
+    wait_for_slot: waitForSlot,
     booking_side: 'adviser',
   });
   if (result.error) {
@@ -17,12 +22,13 @@ async function postDefense(req, res) {
 
 async function postDefenseProposal(req, res) {
   const body = req.body || {};
+  const waitForSlotRaw = body.wait_for_slot ?? body.waitForSlot;
+  const waitForSlot = waitForSlotRaw === true || waitForSlotRaw === 'true' || waitForSlotRaw === 1 || waitForSlotRaw === '1';
+
   const result = await createDefense(req.user.id, {
     ...body,
+    wait_for_slot: waitForSlot,
     booking_side: 'adviser',
-    submit_as_proposal: true,
-    force_pending: Boolean(body.force_proceed),
-    force_proceed: Boolean(body.force_proceed),
   });
 
   if (result.error) {

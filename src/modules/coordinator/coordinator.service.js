@@ -3,6 +3,43 @@ const { createNotification } = require('../notifications/notifications.service')
 
 let defenseScheduleExprCache = null;
 
+async function getInstitutionUserIdsByRoles(institutionId, roles, queryRunner = db) {
+  if (!institutionId || !Array.isArray(roles) || !roles.length) return [];
+  const placeholders = roles.map(() => '?').join(', ');
+  const sql = `SELECT DISTINCT user_id
+               FROM user_roles
+               WHERE institution_id = ?
+                 AND role IN (${placeholders})`;
+  const params = [institutionId, ...roles];
+
+  if (typeof queryRunner.execute === 'function') {
+    const [rows] = await queryRunner.execute(sql, params);
+    return rows.map((row) => row.user_id).filter(Boolean);
+  }
+
+  const { rows } = await queryRunner.query(sql, params);
+  return rows.map((row) => row.user_id).filter(Boolean);
+}
+
+async function notifyUsers(userIds, payload, conn = null) {
+  const recipients = Array.from(new Set((userIds || []).filter(Boolean)));
+  if (!recipients.length) return;
+
+  await Promise.all(
+    recipients.map((userId) => createNotification({
+      userId,
+      type: 'schedule',
+      ...payload,
+      conn,
+    }))
+  );
+}
+
+async function notifyInstitutionCoordinators({ institutionId, excludeUserId, payload, conn = null }) {
+  const userIds = await getInstitutionUserIdsByRoles(institutionId, ['coordinator'], conn || db);
+  const recipients = userIds.filter((userId) => userId !== excludeUserId);
+  await notifyUsers(recipients, payload, conn);
+}
 async function getDefenseScheduleExpr() {
   if (defenseScheduleExprCache) {
     return defenseScheduleExprCache;
@@ -339,6 +376,26 @@ async function addAdviserToInstitution(institutionId, adviserId, courseId, coord
     [adviserId, institutionId, courseId, adviserId]
   );
 
+  const { rows: coordinatorRows } = await db.query(
+    'SELECT full_name FROM users WHERE id = ? LIMIT 1',
+    [coordinatorId]
+  );
+  const coordinatorName = coordinatorRows[0]?.full_name || 'A coordinator';
+
+  await createNotification({
+    userId: adviserId,
+    type: 'invitation',
+    title: 'You were assigned to an institution course',
+    message: `${coordinatorName} assigned you as adviser for course ${course.course_name} (${course.code}).`,
+    metadata: {
+      institutionId,
+      courseId,
+      courseCode: course.code,
+      assignedProjects: assignmentResult.rows?.affectedRows || 0,
+      assignedBy: coordinatorId,
+    },
+  });
+
   return {
     data: {
       success: true,
@@ -348,12 +405,31 @@ async function addAdviserToInstitution(institutionId, adviserId, courseId, coord
   };
 }
 
-async function removeAdviserFromInstitution(institutionId, adviserId) {
+async function removeAdviserFromInstitution(institutionId, adviserId, coordinatorId = null) {
   const { rows } = await db.query(
     `UPDATE user_roles SET institution_id = NULL
      WHERE user_id = ? AND role = 'adviser' AND institution_id = ?`,
     [adviserId, institutionId]
   );
+
+  if (rows?.affectedRows > 0) {
+    const { rows: coordinatorRows } = coordinatorId
+      ? await db.query('SELECT full_name FROM users WHERE id = ? LIMIT 1', [coordinatorId])
+      : { rows: [] };
+    const coordinatorName = coordinatorRows[0]?.full_name || 'A coordinator';
+
+    await createNotification({
+      userId: adviserId,
+      type: 'invitation',
+      title: 'Institution adviser assignment removed',
+      message: `${coordinatorName} removed your adviser assignment for the institution.`,
+      metadata: {
+        institutionId,
+        removedBy: coordinatorId,
+      },
+    });
+  }
+
   return rows;
 }
 
@@ -398,6 +474,20 @@ async function createCourse(institutionId, { courseName, code, description }) {
     [institutionId, code]
   );
 
+  await notifyInstitutionCoordinators({
+    institutionId,
+    payload: {
+      title: 'Course created',
+      message: `Course ${rows[0]?.course_name || courseName} (${rows[0]?.code || code}) was created in your institution.`,
+      metadata: {
+        institutionId,
+        courseId: rows[0]?.id || null,
+        code,
+        event: 'course_created',
+      },
+    },
+  });
+
   return { data: rows[0] };
 }
 
@@ -423,6 +513,20 @@ async function updateCourse(courseId, institutionId, { courseName, code, descrip
   );
 
   const updated = await getCourseById(courseId);
+
+  await notifyInstitutionCoordinators({
+    institutionId,
+    payload: {
+      title: 'Course updated',
+      message: `Course ${updated?.course_name || course.course_name} (${updated?.code || course.code}) was updated.`,
+      metadata: {
+        institutionId,
+        courseId,
+        event: 'course_updated',
+      },
+    },
+  });
+
   return { data: updated };
 }
 
@@ -433,6 +537,20 @@ async function deleteCourse(courseId, institutionId) {
   }
 
   await db.query('DELETE FROM courses WHERE id = ?', [courseId]);
+
+  await notifyInstitutionCoordinators({
+    institutionId,
+    payload: {
+      title: 'Course deleted',
+      message: `Course ${course.course_name} (${course.code}) was deleted from your institution.`,
+      metadata: {
+        institutionId,
+        courseId,
+        event: 'course_deleted',
+      },
+    },
+  });
+
   return { data: { success: true } };
 }
 

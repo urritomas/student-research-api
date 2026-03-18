@@ -1,6 +1,96 @@
 const db = require('../../../config/db');
+const { createNotification } = require('../notifications/notifications.service');
 
 const ADVISER_BOOKING_TABLE = 'meetings';
+
+function formatScheduleLabel(dateValue) {
+  const datePart = dateValue.toLocaleDateString();
+  const timePart = dateValue.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return `${datePart} at ${timePart}`;
+}
+
+async function getAcceptedProjectMembersWithTitle(projectId, queryRunner = db) {
+  const rows = await queryRows(
+    queryRunner,
+    `SELECT pm.user_id, p.title
+     FROM project_members pm
+     JOIN projects p ON p.id = pm.project_id
+     WHERE pm.project_id = ?
+       AND pm.status = 'accepted'`,
+    [projectId]
+  );
+
+  return {
+    projectTitle: rows[0]?.title || 'your project',
+    userIds: rows.map((row) => row.user_id).filter(Boolean),
+  };
+}
+
+async function notifyProjectMembers({
+  projectId,
+  title,
+  message,
+  metadata,
+  excludeUserId = null,
+  conn = null,
+}) {
+  const queryRunner = conn || db;
+  const { userIds } = await getAcceptedProjectMembersWithTitle(projectId, queryRunner);
+  const recipients = userIds.filter((id) => id && id !== excludeUserId);
+
+  if (!recipients.length) return;
+
+  await Promise.all(
+    recipients.map((userId) => createNotification({
+      userId,
+      type: 'schedule',
+      title,
+      message,
+      metadata,
+      conn,
+    }))
+  );
+}
+
+async function getInstitutionCoordinatorIds(institutionId, queryRunner = db) {
+  const rows = await queryRows(
+    queryRunner,
+    `SELECT DISTINCT user_id
+     FROM user_roles
+     WHERE institution_id = ?
+       AND role = 'coordinator'`,
+    [institutionId]
+  );
+  return rows.map((row) => row.user_id).filter(Boolean);
+}
+
+async function notifyInstitutionCoordinators({
+  institutionId,
+  title,
+  message,
+  metadata,
+  excludeUserId = null,
+  conn = null,
+}) {
+  if (!institutionId) return;
+
+  const queryRunner = conn || db;
+  const userIds = await getInstitutionCoordinatorIds(institutionId, queryRunner);
+  const recipients = userIds.filter((id) => id && id !== excludeUserId);
+
+  if (!recipients.length) return;
+
+  await Promise.all(
+    recipients.map((userId) => createNotification({
+      userId,
+      type: 'schedule',
+      title,
+      message,
+      metadata,
+      conn,
+    }))
+  );
+}
 
 function toDate(value) {
   const date = new Date(value);
@@ -487,7 +577,7 @@ async function createDefense(userId, payload) {
     await conn.beginTransaction();
 
     const [projectRows] = await conn.execute(
-      'SELECT id, institution_id FROM projects WHERE id = ? LIMIT 1',
+      'SELECT id, institution_id, title FROM projects WHERE id = ? LIMIT 1',
       [project_id]
     );
 
@@ -541,6 +631,51 @@ async function createDefense(userId, payload) {
       `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE id = ? LIMIT 1`,
       [defenseId]
     );
+
+    const scheduledLabel = formatScheduleLabel(normalizedSchedule.dateValue);
+    const eventTitle = status === 'pending'
+      ? 'Defense request queued'
+      : 'Defense booking created';
+    const eventMessage = status === 'pending'
+      ? `A ${defense_type} defense request for "${project.title}" was queued for ${scheduledLabel}${location ? ` at ${location}` : ''}.`
+      : `A ${defense_type} defense for "${project.title}" was booked on ${scheduledLabel}${location ? ` at ${location}` : ''}.`;
+
+    await notifyProjectMembers({
+      projectId: project_id,
+      title: eventTitle,
+      message: eventMessage,
+      metadata: {
+        defenseId,
+        projectId: project_id,
+        defenseType: defense_type,
+        schedule: normalizedSchedule.dbValue,
+        endTime: normalizedEnd.dbValue,
+        location,
+        status,
+      },
+      excludeUserId: userId,
+      conn,
+    });
+
+    await notifyInstitutionCoordinators({
+      institutionId: project.institution_id,
+      title: status === 'pending' ? 'Defense request awaiting review' : 'Defense booking submitted',
+      message: status === 'pending'
+        ? `A ${defense_type} defense request for "${project.title}" is queued and awaiting available slot.`
+        : `A ${defense_type} defense for "${project.title}" was submitted for ${scheduledLabel}${location ? ` at ${location}` : ''}.`,
+      metadata: {
+        defenseId,
+        projectId: project_id,
+        institutionId: project.institution_id,
+        defenseType: defense_type,
+        schedule: normalizedSchedule.dbValue,
+        endTime: normalizedEnd.dbValue,
+        location,
+        status,
+      },
+      excludeUserId: userId,
+      conn,
+    });
 
     await conn.commit();
 
@@ -606,7 +741,11 @@ async function cancelDefense(userId, defenseId) {
   }
 
   const { rows } = await db.query(
-    `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE id = ? LIMIT 1`,
+    `SELECT d.*, p.title AS project_title, p.institution_id
+     FROM ${ADVISER_BOOKING_TABLE} d
+     LEFT JOIN projects p ON p.id = d.project_id
+     WHERE d.id = ?
+     LIMIT 1`,
     [defenseId]
   );
 
@@ -627,6 +766,43 @@ async function cancelDefense(userId, defenseId) {
     `UPDATE ${ADVISER_BOOKING_TABLE} SET status = 'cancelled' WHERE id = ?`,
     [defenseId]
   );
+
+  const { projectTitle } = await getAcceptedProjectMembersWithTitle(defense.project_id);
+  const scheduledDate = toDate(defense.scheduled_at);
+  const scheduleLabel = scheduledDate ? formatScheduleLabel(scheduledDate) : 'the selected schedule';
+
+  await notifyProjectMembers({
+    projectId: defense.project_id,
+    title: 'Defense booking cancelled',
+    message: `A ${defense.defense_type} defense for "${projectTitle}" scheduled on ${scheduleLabel} was cancelled.`,
+    metadata: {
+      defenseId: defense.id,
+      projectId: defense.project_id,
+      defenseType: defense.defense_type,
+      status: 'cancelled',
+      schedule: defense.scheduled_at,
+      endTime: defense.end_time || null,
+      location: defense.location || null,
+    },
+    excludeUserId: userId,
+  });
+
+  await notifyInstitutionCoordinators({
+    institutionId: defense.institution_id,
+    title: 'Defense booking cancelled by adviser',
+    message: `A ${defense.defense_type} defense for "${defense.project_title || projectTitle}" scheduled on ${scheduleLabel} was cancelled.`,
+    metadata: {
+      defenseId: defense.id,
+      projectId: defense.project_id,
+      institutionId: defense.institution_id,
+      defenseType: defense.defense_type,
+      status: 'cancelled',
+      schedule: defense.scheduled_at,
+      endTime: defense.end_time || null,
+      location: defense.location || null,
+    },
+    excludeUserId: userId,
+  });
 
   await processAllPendingDefenses();
 
@@ -656,7 +832,11 @@ async function rescheduleDefense(userId, defenseId, payload) {
   }
 
   const { rows } = await db.query(
-    `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE id = ? LIMIT 1`,
+    `SELECT d.*, p.title AS project_title, p.institution_id
+     FROM ${ADVISER_BOOKING_TABLE} d
+     LEFT JOIN projects p ON p.id = d.project_id
+     WHERE d.id = ?
+     LIMIT 1`,
     [defenseId]
   );
 
@@ -726,6 +906,45 @@ async function rescheduleDefense(userId, defenseId, payload) {
       [defenseId]
     );
 
+    await notifyProjectMembers({
+      projectId: defense.project_id,
+      title: 'Defense booking rescheduled',
+      message: `A ${defense.defense_type} defense for "${defense.project_title || 'your project'}" was moved to ${formatScheduleLabel(normalizedSchedule.dateValue)}${defense.location ? ` at ${defense.location}` : ''}.`,
+      metadata: {
+        defenseId,
+        projectId: defense.project_id,
+        defenseType: defense.defense_type,
+        previousSchedule: defense.scheduled_at,
+        previousEndTime: defense.end_time || null,
+        schedule: normalizedSchedule.dbValue,
+        endTime: normalizedEnd.dbValue,
+        location: defense.location || null,
+        status: 'rescheduled',
+      },
+      excludeUserId: userId,
+      conn,
+    });
+
+    await notifyInstitutionCoordinators({
+      institutionId: defense.institution_id,
+      title: 'Defense booking rescheduled by adviser',
+      message: `A ${defense.defense_type} defense for "${defense.project_title || 'a project'}" was moved to ${formatScheduleLabel(normalizedSchedule.dateValue)}${defense.location ? ` at ${defense.location}` : ''}.`,
+      metadata: {
+        defenseId,
+        projectId: defense.project_id,
+        institutionId: defense.institution_id,
+        defenseType: defense.defense_type,
+        previousSchedule: defense.scheduled_at,
+        previousEndTime: defense.end_time || null,
+        schedule: normalizedSchedule.dbValue,
+        endTime: normalizedEnd.dbValue,
+        location: defense.location || null,
+        status: 'rescheduled',
+      },
+      excludeUserId: userId,
+      conn,
+    });
+
     await conn.commit();
 
     await processAllPendingDefenses();
@@ -754,10 +973,11 @@ async function processAllPendingDefenses() {
     await conn.beginTransaction();
 
     const [pendingRows] = await conn.execute(
-      `SELECT *
-       FROM ${ADVISER_BOOKING_TABLE}
+      `SELECT m.*, p.institution_id, p.title AS project_title
+       FROM ${ADVISER_BOOKING_TABLE} m
+       LEFT JOIN projects p ON p.id = m.project_id
        WHERE status = 'pending'
-       ORDER BY created_at ASC`
+       ORDER BY m.created_at ASC`
     );
 
     for (const pending of pendingRows) {
@@ -783,6 +1003,41 @@ async function processAllPendingDefenses() {
            WHERE id = ?`,
           [pending.id]
         );
+
+        const { projectTitle } = await getAcceptedProjectMembersWithTitle(pending.project_id, conn);
+        await notifyProjectMembers({
+          projectId: pending.project_id,
+          title: 'Queued defense is now scheduled',
+          message: `The queued ${pending.defense_type} defense for "${projectTitle}" is now scheduled for ${formatScheduleLabel(normalizedSchedule.dateValue)}${pending.location ? ` at ${pending.location}` : ''}.`,
+          metadata: {
+            defenseId: pending.id,
+            projectId: pending.project_id,
+            defenseType: pending.defense_type,
+            schedule: normalizedSchedule.dbValue,
+            endTime: normalizedEnd.dbValue,
+            location: pending.location || null,
+            status: 'scheduled',
+          },
+          conn,
+        });
+
+        await notifyInstitutionCoordinators({
+          institutionId: pending.institution_id,
+          title: 'Queued defense auto-scheduled',
+          message: `The queued ${pending.defense_type} defense for "${pending.project_title || projectTitle}" is now scheduled for ${formatScheduleLabel(normalizedSchedule.dateValue)}${pending.location ? ` at ${pending.location}` : ''}.`,
+          metadata: {
+            defenseId: pending.id,
+            projectId: pending.project_id,
+            institutionId: pending.institution_id,
+            defenseType: pending.defense_type,
+            schedule: normalizedSchedule.dbValue,
+            endTime: normalizedEnd.dbValue,
+            location: pending.location || null,
+            status: 'scheduled',
+            source: 'pending_queue',
+          },
+          conn,
+        });
       }
     }
 

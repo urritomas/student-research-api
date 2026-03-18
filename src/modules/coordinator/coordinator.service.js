@@ -704,77 +704,116 @@ async function getCoordinatorStats(institutionId) {
 }
 
 async function createDefenseForCourse(institutionId, coordinatorId, payload) {
-  const { courseId, defenseType, scheduledAt, location, venue } = payload;
+  const { courseId, defenseType, scheduledAt, date, startTime, endTime, location, venue } = payload;
 
   if (!courseId) return { error: 'courseId is required' };
   if (!defenseType || !['proposal', 'midterm', 'final'].includes(defenseType)) {
     return { error: 'defenseType must be one of: proposal, midterm, final' };
   }
-  if (!scheduledAt) return { error: 'scheduledAt is required' };
   if (!location) return { error: 'location is required' };
+
+  const startInput = scheduledAt || (date && startTime ? `${date}T${startTime}` : null);
+  const endInput = date && endTime ? `${date}T${endTime}` : null;
+  const scheduleWindow = getScheduleWindow({ start_time: startInput, end_time: endInput });
+  if (scheduleWindow.error) return { error: scheduleWindow.error };
+
+  const normalizedStart = scheduleWindow.start;
+  const normalizedEnd = scheduleWindow.end;
 
   const course = await getCourseById(courseId);
   if (!course || course.institution_id !== institutionId) {
     return { error: 'Course not found in your institution' };
   }
 
-  const { rows: projects } = await db.query(
-    `SELECT p.id, p.title, p.project_code
+  // Resolve adviser IDs for the selected course first.
+  const { rows: courseAdviserRows } = await db.query(
+    `SELECT DISTINCT pm.user_id
      FROM projects p
-     WHERE p.course_id = ? AND p.institution_id = ?`,
-    [courseId, institutionId]
+     JOIN project_members pm
+       ON pm.project_id = p.id
+      AND pm.role = 'adviser'
+      AND pm.status = 'accepted'
+     WHERE p.institution_id = ?
+       AND p.course_id = ?`,
+    [institutionId, courseId]
   );
 
-  if (projects.length === 0) {
-    return { error: 'No projects found in this course' };
+  let adviserIds = courseAdviserRows.map((row) => row.user_id);
+
+  // Fallback: if the selected course currently has no adviser-project links,
+  // use institution advisers and discover their advised projects.
+  if (!adviserIds.length) {
+    const { rows: institutionAdviserRows } = await db.query(
+      `SELECT DISTINCT user_id
+       FROM user_roles
+       WHERE institution_id = ?
+         AND role = 'adviser'`,
+      [institutionId]
+    );
+
+    adviserIds = institutionAdviserRows.map((row) => row.user_id);
+  }
+
+  if (!adviserIds.length) {
+    return { error: 'No advisers found for this institution.' };
+  }
+
+  const adviserPlaceholders = adviserIds.map(() => '?').join(', ');
+
+  const { rows: projectAdviserRows } = await db.query(
+    `SELECT DISTINCT p.id, p.title, p.project_code, pm.user_id AS adviser_id
+     FROM projects p
+     JOIN project_members pm
+       ON pm.project_id = p.id
+      AND pm.role = 'adviser'
+      AND pm.status = 'accepted'
+     WHERE p.institution_id = ?
+       AND pm.user_id IN (${adviserPlaceholders})`,
+    [institutionId, ...adviserIds]
+  );
+
+  if (projectAdviserRows.length === 0) {
+    return { error: 'No adviser-linked projects found for defense event creation.' };
   }
 
   const createdDefenses = [];
+  const notifiedProjects = new Set();
 
-  for (const project of projects) {
-    const { rows: adviserRows } = await db.query(
-      `SELECT DISTINCT pm.user_id
-       FROM project_members pm
-       WHERE pm.project_id = ?
-         AND pm.role = 'adviser'
-         AND pm.status = 'accepted'`,
-      [project.id]
+  for (const row of projectAdviserRows) {
+    await db.query(
+      `INSERT INTO defenses (id, project_id, adviser_id, defense_type, scheduled_at, end_time, location, venue, status, created_by)
+       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?)`,
+      [row.id, row.adviser_id, defenseType, normalizedStart.dbValue, normalizedEnd.dbValue, location, venue || null, coordinatorId]
     );
 
-    const adviserIds = adviserRows.length
-      ? adviserRows.map((row) => row.user_id)
-      : [coordinatorId];
+    const { rows: defenseRows } = await db.query(
+      `SELECT *
+       FROM defenses
+       WHERE project_id = ?
+         AND adviser_id = ?
+         AND created_by = ?
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [row.id, row.adviser_id, coordinatorId]
+    );
 
-    for (const adviserId of adviserIds) {
-      await db.query(
-        `INSERT INTO defenses (id, project_id, adviser_id, defense_type, scheduled_at, location, venue, status, created_by)
-         VALUES (UUID(), ?, ?, ?, ?, ?, ?, 'scheduled', ?)`,
-        [project.id, adviserId, defenseType, scheduledAt, location, venue || null, coordinatorId]
-      );
-
-      const { rows: defenseRows } = await db.query(
-        `SELECT *
-         FROM defenses
-         WHERE project_id = ?
-           AND adviser_id = ?
-           AND created_by = ?
-         ORDER BY created_at DESC
-         LIMIT 1`,
-        [project.id, adviserId, coordinatorId]
-      );
-
-      if (defenseRows[0]) {
-        createdDefenses.push({ ...defenseRows[0], project_title: project.title, project_code: project.project_code });
-      }
+    if (defenseRows[0]) {
+      createdDefenses.push({ ...defenseRows[0], project_title: row.title, project_code: row.project_code });
     }
+
+    if (notifiedProjects.has(row.id)) {
+      continue;
+    }
+
+    notifiedProjects.add(row.id);
 
     const { rows: members } = await db.query(
       'SELECT user_id FROM project_members WHERE project_id = ?',
-      [project.id]
+      [row.id]
     );
 
     const notifTitle = `${defenseType.charAt(0).toUpperCase() + defenseType.slice(1)} Defense Scheduled`;
-    const notifMessage = `A ${defenseType} defense for "${project.title}" has been scheduled on ${new Date(scheduledAt).toLocaleDateString()} at ${location}.`;
+    const notifMessage = `A ${defenseType} defense for "${row.title}" has been scheduled on ${normalizedStart.dateValue.toLocaleDateString()} at ${normalizedStart.dateValue.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`;
 
     for (const member of members) {
       await createNotification({
@@ -782,7 +821,7 @@ async function createDefenseForCourse(institutionId, coordinatorId, payload) {
         type: 'schedule',
         title: notifTitle,
         message: notifMessage,
-        metadata: { defenseId: defenseRows[0]?.id, projectId: project.id },
+        metadata: { projectId: row.id },
       });
     }
   }

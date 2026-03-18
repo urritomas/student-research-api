@@ -159,12 +159,12 @@ async function setVenue(req, res) {
 
 async function createDefenseForCourse(req, res) {
   const { courseId } = req.params;
-  const { defenseType, scheduledAt, location, venue } = req.body;
+  const { defenseType, scheduledAt, date, startTime, endTime, location, venue } = req.body;
 
   const result = await coordinatorService.createDefenseForCourse(
     req.institution.id,
     req.user.id,
-    { courseId, defenseType, scheduledAt, location, venue }
+    { courseId, defenseType, scheduledAt, date, startTime, endTime, location, venue }
   );
 
   if (result.error) {

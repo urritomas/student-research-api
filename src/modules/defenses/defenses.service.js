@@ -1,5 +1,7 @@
 const db = require('../../../config/db');
 
+const ADVISER_BOOKING_TABLE = 'meetings';
+
 function toDate(value) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
@@ -373,7 +375,7 @@ function normalizeScheduleSources(scheduleSources) {
     .filter((item, index, arr) => arr.indexOf(item) === index)
     .filter((item) => Boolean(SCHEDULE_SOURCE_CONFIG[item]));
 
-  return normalized.length ? normalized : ['defenses'];
+  return normalized.length ? normalized : [ADVISER_BOOKING_TABLE, 'defenses'];
 }
 
 function resolveBookingScheduleSources(payload = {}) {
@@ -559,7 +561,7 @@ async function createDefense(userId, payload) {
 
       if (force_pending || submit_as_proposal || force_proceed) {
         status = 'pending';
-        blockedBy = scheduleCheck.conflicts.find((conflict) => conflict.source_table === 'defenses')?.defense_id || null;
+        blockedBy = scheduleCheck.conflicts[0]?.defense_id || null;
       } else {
         await conn.rollback();
         return {
@@ -573,13 +575,13 @@ async function createDefense(userId, payload) {
     const defenseId = idRows[0].id;
 
     await conn.execute(
-      `INSERT INTO defenses (id, project_id, defense_type, scheduled_at, end_time, location, modality, status, blocked_by, created_by)
+      `INSERT INTO ${ADVISER_BOOKING_TABLE} (id, project_id, defense_type, scheduled_at, end_time, location, modality, status, blocked_by, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [defenseId, project_id, defense_type, normalizedSchedule.dbValue, normalizedEnd.dbValue, location, modality || 'Online', status, blockedBy, userId]
     );
 
     const [rows] = await conn.execute(
-      'SELECT * FROM defenses WHERE id = ? LIMIT 1',
+      `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE id = ? LIMIT 1`,
       [defenseId]
     );
 
@@ -617,7 +619,7 @@ async function getDefensesByUser(userId) {
               WHEN d.status = 'completed' THEN 'Completed'
               ELSE d.status
             END AS status_label
-     FROM defenses d
+               FROM ${ADVISER_BOOKING_TABLE} d
      LEFT JOIN projects p ON d.project_id = p.id
      WHERE d.created_by = ?
      ORDER BY d.scheduled_at DESC`,
@@ -630,7 +632,7 @@ async function getDefensesForMember(userId) {
   const { rows } = await db.query(
     `SELECT d.*, p.title AS project_title, p.project_code,
             u.full_name AS created_by_name
-     FROM defenses d
+     FROM ${ADVISER_BOOKING_TABLE} d
      JOIN projects p ON d.project_id = p.id
      JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = ?
      LEFT JOIN users u ON d.created_by = u.id
@@ -646,7 +648,7 @@ async function cancelDefense(userId, defenseId) {
   }
 
   const { rows } = await db.query(
-    'SELECT * FROM defenses WHERE id = ? LIMIT 1',
+    `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE id = ? LIMIT 1`,
     [defenseId]
   );
 
@@ -664,7 +666,7 @@ async function cancelDefense(userId, defenseId) {
   }
 
   await db.query(
-    `UPDATE defenses SET status = 'cancelled' WHERE id = ?`,
+    `UPDATE ${ADVISER_BOOKING_TABLE} SET status = 'cancelled' WHERE id = ?`,
     [defenseId]
   );
 
@@ -681,7 +683,7 @@ async function cancelDefense(userId, defenseId) {
               WHEN d.status = 'completed' THEN 'Completed'
               ELSE d.status
             END AS status_label
-     FROM defenses d
+     FROM ${ADVISER_BOOKING_TABLE} d
      LEFT JOIN projects p ON d.project_id = p.id
      WHERE d.id = ?
      LIMIT 1`,
@@ -693,7 +695,7 @@ async function cancelDefense(userId, defenseId) {
 
 async function promotePendingDefenses(cancelledDefenseId) {
   const { rows: pendingRows } = await db.query(
-    `SELECT * FROM defenses WHERE blocked_by = ? AND status = 'pending'`,
+    `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE blocked_by = ? AND status = 'pending'`,
     [cancelledDefenseId]
   );
 
@@ -709,12 +711,12 @@ async function promotePendingDefenses(cancelledDefenseId) {
       location: pending.location,
       fallbackTeacherId: pending.created_by,
       statuses: ['scheduled', 'approved', 'moved'],
-      scheduleSources: ['defenses'],
+      scheduleSources: [ADVISER_BOOKING_TABLE, 'defenses'],
     });
 
     if (recheck.ok) {
       await db.query(
-        `UPDATE defenses SET status = 'scheduled', blocked_by = NULL WHERE id = ?`,
+        `UPDATE ${ADVISER_BOOKING_TABLE} SET status = 'scheduled', blocked_by = NULL WHERE id = ?`,
         [pending.id]
       );
     }
@@ -729,7 +731,7 @@ async function processAllPendingDefenses() {
     await conn.beginTransaction();
 
     const [pendingRows] = await conn.execute(
-      `SELECT * FROM defenses WHERE status = 'pending' ORDER BY created_at ASC`
+      `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE status = 'pending' ORDER BY created_at ASC`
     );
 
     for (const pending of pendingRows) {
@@ -744,13 +746,13 @@ async function processAllPendingDefenses() {
         location: pending.location,
         fallbackTeacherId: pending.created_by,
         statuses: ['scheduled', 'approved', 'moved'],
-        scheduleSources: ['defenses'],
+        scheduleSources: [ADVISER_BOOKING_TABLE, 'defenses'],
         queryRunner: conn,
       });
 
       if (recheck.ok) {
         await conn.execute(
-          `UPDATE defenses SET status = 'scheduled', blocked_by = NULL WHERE id = ?`,
+          `UPDATE ${ADVISER_BOOKING_TABLE} SET status = 'scheduled', blocked_by = NULL WHERE id = ?`,
           [pending.id]
         );
       }
@@ -777,7 +779,7 @@ async function rescheduleDefense(userId, defenseId, payload) {
   }
 
   const { rows } = await db.query(
-    'SELECT * FROM defenses WHERE id = ? LIMIT 1',
+    `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE id = ? LIMIT 1`,
     [defenseId]
   );
 
@@ -807,7 +809,7 @@ async function rescheduleDefense(userId, defenseId, payload) {
     await conn.beginTransaction();
 
     await conn.execute(
-      `UPDATE defenses SET status = 'cancelled' WHERE id = ?`,
+      `UPDATE ${ADVISER_BOOKING_TABLE} SET status = 'cancelled' WHERE id = ?`,
       [defenseId]
     );
 
@@ -818,7 +820,7 @@ async function rescheduleDefense(userId, defenseId, payload) {
       location: defense.location,
       fallbackTeacherId: userId,
       statuses: ['scheduled', 'approved', 'moved'],
-      scheduleSources: ['defenses'],
+      scheduleSources: [ADVISER_BOOKING_TABLE, 'defenses'],
       queryRunner: conn,
     });
 
@@ -836,14 +838,14 @@ async function rescheduleDefense(userId, defenseId, payload) {
     }
 
     await conn.execute(
-      `UPDATE defenses
+      `UPDATE ${ADVISER_BOOKING_TABLE}
        SET scheduled_at = ?, end_time = ?, status = 'rescheduled', blocked_by = NULL
        WHERE id = ?`,
       [normalizedSchedule.dbValue, normalizedEnd.dbValue, defenseId]
     );
 
     const [updatedRows] = await conn.execute(
-      'SELECT * FROM defenses WHERE id = ? LIMIT 1',
+      `SELECT * FROM ${ADVISER_BOOKING_TABLE} WHERE id = ? LIMIT 1`,
       [defenseId]
     );
 

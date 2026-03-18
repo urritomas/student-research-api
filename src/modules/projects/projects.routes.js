@@ -2,6 +2,7 @@ const express = require('express');
 const { requireAuth } = require('../../middleware/auth');
 const { createDocumentUpload } = require('../../middleware/multer');
 const controller = require('./projects.controller');
+const paperVersionsRouter = require('../paper_versions/paper_versions.routes');
 
 const router = express.Router();
 
@@ -36,5 +37,6 @@ router.get('/:id/invitations', asyncHandler(controller.getInvitations));
 router.post('/:id/invite', asyncHandler(controller.invite));
 router.post('/:id/schedule', asyncHandler(controller.scheduleDefense));
 router.patch('/:id/status', asyncHandler(controller.updateStatus));
+router.use('/:id/paper-versions', paperVersionsRouter);
 
 module.exports = router;

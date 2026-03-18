@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const path = require('path');
+const fs = require('fs');
 const {
   corsOrigins,
   uploadBase,
@@ -15,9 +16,9 @@ const authRouter = require('./modules/auth/auth.routes');
 const uploadRouter = require('./modules/upload/upload.routes');
 const projectsRouter = require('./modules/projects/projects.routes');
 const notificationsRouter = require('./modules/notifications/notifications.routes');
-const paperVersionsRouter = require('./modules/paper_versions/paper_versions.routes');
 const defensesRouter = require('./modules/defenses/defenses.routes');
 const coordinatorRouter = require('./modules/coordinator/coordinator.routes');
+const fileOperationsRouter = require('./modules/file_operations/file_operations.routes');
 const app = express();
 
 app.disable('x-powered-by');
@@ -58,6 +59,40 @@ app.use(express.json({ limit: '10mb' })); // For parsing application/json (allow
 app.use(express.urlencoded({ extended: true, limit: '10mb' })); // For parsing application/x-www-form-urlencoded
 const legacyUploadBase = path.join(__dirname, '..', 'uploads');
 
+const AVATAR_FALLBACK_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2n8AAAAASUVORK5CYII=',
+  'base64',
+);
+
+function trySendAvatar(baseDir, filename, res) {
+  const avatarPath = path.join(baseDir, 'avatars', filename);
+  if (!fs.existsSync(avatarPath)) return false;
+  res.sendFile(avatarPath);
+  return true;
+}
+
+// Return a tiny placeholder image when the avatar file no longer exists.
+app.get('/uploads/avatars/:filename', (req, res, next) => {
+  const filename = req.params.filename || '';
+  const safeFilename = path.basename(filename);
+
+  if (!safeFilename || safeFilename !== filename) {
+    return next();
+  }
+
+  if (trySendAvatar(uploadBase, safeFilename, res)) {
+    return;
+  }
+
+  if (legacyUploadBase !== uploadBase && trySendAvatar(legacyUploadBase, safeFilename, res)) {
+    return;
+  }
+
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Cache-Control', isProduction ? 'public, max-age=300' : 'no-store');
+  res.status(200).send(AVATAR_FALLBACK_PNG);
+});
+
 app.use('/uploads', express.static(uploadBase, {
   maxAge: isProduction ? '1d' : 0,
 }));
@@ -86,9 +121,10 @@ app.use('/api/users', usersRouter);
 app.use('/api/upload', uploadRouter);
 app.use('/api/projects', projectsRouter);
 app.use('/api/notifications', notificationsRouter);
-app.use('/api/projects/:id/paper-versions', paperVersionsRouter);
 app.use('/api/defenses', defensesRouter);
 app.use('/api/coordinator', coordinatorRouter);
+app.use('/api', fileOperationsRouter);
+app.use('/api/file-operations', fileOperationsRouter);
 
 app.use((err, req, res, next) => {
   if (err.message === 'Not allowed by CORS') {

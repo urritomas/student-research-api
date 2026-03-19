@@ -50,7 +50,7 @@ async function addAdviser(req, res) {
 
 async function removeAdviser(req, res) {
   const { adviserId } = req.params;
-  await coordinatorService.removeAdviserFromInstitution(req.institution.id, adviserId);
+  await coordinatorService.removeAdviserFromInstitution(req.institution.id, adviserId, req.user.id);
   return res.json({ success: true });
 }
 

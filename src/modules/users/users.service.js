@@ -1,4 +1,5 @@
 const db = require('../../../config/db');
+const { createNotification } = require('../notifications/notifications.service');
 
 const ALLOWED_ROLE_VALUES = new Set(['student', 'teacher', 'adviser', 'coordinator']);
 
@@ -196,6 +197,34 @@ async function completeProfile(userId, payload) {
       [institutionId, currentRole.rows[0].id],
     );
   }
+
+  const roleWelcomeMessages = {
+    student: {
+      title: 'Student account ready',
+      message: 'Your student account is ready. You can now join or create a research project.',
+    },
+    adviser: {
+      title: 'Adviser account ready',
+      message: 'Your adviser account is ready. You can now manage projects and defense schedules.',
+    },
+    coordinator: {
+      title: 'Coordinator account ready',
+      message: 'Your coordinator account is ready. You can now manage institution courses, advisers, and defenses.',
+    },
+  };
+
+  const welcome = roleWelcomeMessages[role] || roleWelcomeMessages.student;
+  await createNotification({
+    userId,
+    type: 'invitation',
+    title: welcome.title,
+    message: welcome.message,
+    metadata: {
+      role,
+      institutionId,
+      event: 'profile_completed',
+    },
+  });
 
   return {
     data: {
